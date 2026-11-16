@@ -1,4 +1,4 @@
-import { type AppSettings, settingsFrom } from "./capture";
+import { type AppSettings, configError, settingsFrom } from "./capture";
 import type { GorgiasCredentials } from "./gorgias";
 import type { OverturnCredentials } from "./overturn";
 
@@ -55,6 +55,8 @@ export function appSettingsFromEnv(env: Record<string, string | undefined>): App
 /** The environment of a self-hosted install: the app Gorgias calls, and the API it files to. */
 export function configFrom(env: Record<string, string | undefined>): Config {
   const settings = appSettingsFromEnv(env);
+  const wrong = configError(settings);
+  if (wrong) throw new Error(wrong);
   const port = Number(env.PORT ?? 3000);
   return {
     settings,
@@ -71,8 +73,11 @@ export function configFrom(env: Record<string, string | undefined>): Config {
 export function installConfigFrom(env: Record<string, string | undefined>): InstallConfig {
   const settings = appSettingsFromEnv(env);
   const appUrl = settings.appUrl || required(env, "APP_URL");
+  const ready = { ...settings, appUrl };
+  const wrong = configError(ready);
+  if (wrong) throw new Error(wrong);
   return {
-    settings: { ...settings, appUrl },
+    settings: ready,
     gorgias: gorgiasCredentials(env),
     appUrl,
     token: settings.widgetToken,

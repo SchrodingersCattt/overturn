@@ -32,6 +32,8 @@ describe("the Gorgias REST API", () => {
         from_agent: true,
         sender: { email: "ray@acme.com", name: "Ray" },
         created_datetime: "2026-10-01T10:05:00Z",
+        sent_datetime: "2026-10-01T10:06:00Z",
+        failed_datetime: null,
         body_text: "Second damaged lid this month.",
       }),
     ).toEqual({
@@ -40,11 +42,22 @@ describe("the Gorgias REST API", () => {
       fromAgent: true,
       senderName: "Ray",
       senderEmail: "ray@acme.com",
+      sentAt: "2026-10-01T10:06:00Z",
+      failedAt: null,
       createdAt: "2026-10-01T10:05:00Z",
       text: "Second damaged lid this month.",
     });
     expect(messageSnapshotFrom({}).public).toBe(true);
     expect(messageSnapshotFrom({}).fromAgent).toBe(false);
+  });
+
+  it("keeps what Gorgias says about sending: created is not sent, and a failure is a failure", () => {
+    // Created but not sent yet: no sent_datetime.
+    expect(messageSnapshotFrom({ id: 9, created_datetime: "2026-10-01T13:00:00Z" }).sentAt).toBeNull();
+    // Gorgias reports the sending error on the message, not only in failed_datetime.
+    expect(messageSnapshotFrom({ id: 9, last_sending_error: { msg: "relay refused" } }).failedAt).toBe(
+      "sending-error",
+    );
   });
 
   it("maps a ticket: decision fields and order context by label", () => {
@@ -97,6 +110,32 @@ describe("the Gorgias REST API", () => {
       `Basic ${Buffer.from("api@acme.com:key").toString("base64")}`,
     );
     expect(ticket.order).toEqual({ order_id: "4509" });
+  });
+
+  it("reads the message list newest first, and hands it back oldest first", async () => {
+    const calls: string[] = [];
+    const client = createGorgiasClient(
+      { domain: "acme", email: "api@acme.com", apiKey: "key" },
+      settingsFrom({}),
+      (async (url: string) => {
+        calls.push(url);
+        return new Response(
+          JSON.stringify({
+            data: [
+              { id: 9, from_agent: true, sent_datetime: "2026-10-01T13:00:00Z", body_text: "sent" },
+              { id: 8, from_agent: true, body_text: "still being created" },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as typeof fetch,
+    );
+    const messages = await client.messages(48213);
+    expect(calls[0]).toContain("/api/messages?ticket_id=48213&order_by=created_datetime%3Adesc&limit=10");
+    // The API answers newest first; the app wants the thread the way the human read it.
+    expect(messages.map((m) => m.id)).toEqual([8, 9]);
+    expect(messages[1]?.sentAt).toBe("2026-10-01T13:00:00Z");
+    expect(messages[0]?.sentAt).toBeNull();
   });
 
   it("says which ticket it could not read", async () => {

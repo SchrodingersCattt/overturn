@@ -25,7 +25,7 @@ const env = {
   GORGIAS_API_KEY: "gk",
   OVERTURN_API_KEY: "ov_k",
   APP_URL: "https://app.overturn.test",
-  WIDGET_TOKEN: "w_secret",
+  WIDGET_TOKEN: "w_secret_shared_secret_32chars",
   AGENT: "support-reply",
   REASON_PACK: "support",
   DECISION_FIELDS: "status:status",
@@ -43,7 +43,7 @@ describe("the app's environment", () => {
       overturn: { apiKey: "ov_k", baseUrl: "https://api.overturn.run" },
       settings: {
         appUrl: "https://app.overturn.test",
-        widgetToken: "w_secret",
+        widgetToken: "w_secret_shared_secret_32chars",
         agent: "support-reply",
         reasonPack: "support",
         minDraftChars: 60,
@@ -55,16 +55,19 @@ describe("the app's environment", () => {
     expect(config.settings.requireReason).toBe(true);
   });
 
-  it("reads a port, and says what is missing", () => {
+  it("reads a port, and refuses a deployment that would leave the routes open", () => {
     expect(configFrom({ ...env, PORT: "8080" }).port).toBe(8080);
     expect(configFrom({ ...env, PORT: "nonsense" }).port).toBe(3000);
     expect(() => configFrom({ ...env, GORGIAS_DOMAIN: "" })).toThrow(/GORGIAS_DOMAIN/);
     expect(() => configFrom({ ...env, OVERTURN_API_KEY: undefined })).toThrow(/OVERTURN_API_KEY/);
+    expect(() => configFrom({ ...env, WIDGET_TOKEN: undefined })).toThrow(/WIDGET_TOKEN is required/);
+    expect(() => configFrom({ ...env, WIDGET_TOKEN: "short" })).toThrow(/at least 24 characters/);
+    expect(() => configFrom({ ...env, APP_URL: undefined })).toThrow(/APP_URL is required/);
   });
 });
 
 describe("the Overturn client", () => {
-  it("finds the run a drafting agent recorded for the Gorgias ticket", async () => {
+  it("finds the run a drafting agent recorded, with what says whether it is a draft at all", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const client = createOverturnClient({ baseUrl: "https://api.overturn.run/", apiKey: "ov_k" }, (async (
       url: string,
@@ -78,7 +81,7 @@ describe("the Overturn client", () => {
 
     const run = await client.lastRun("gr:48213", "support-reply");
     expect(calls[0]?.url).toBe(
-      "https://api.overturn.run/v1/runs?externalId=gr%3A48213&agent=support-reply&limit=1",
+      "https://api.overturn.run/v1/runs?externalId=gr%3A48213&agent=support-reply&limit=5",
     );
     expect((calls[0]?.init.headers as Record<string, string> | undefined)?.Authorization).toBe("Bearer ov_k");
     expect(run).toEqual({
@@ -87,7 +90,18 @@ describe("the Overturn client", () => {
       output: "Hi Dana",
       model: null,
       endedAt: "2026-10-01T12:00:00Z",
+      source: null,
+      tags: [],
     });
+  });
+
+  it("reports the provenance a synthesized run carries", async () => {
+    const client = createOverturnClient({ baseUrl: "https://api.overturn.run", apiKey: "ov_k" }, (async () =>
+      json({
+        items: [{ id: "run-2", output: "x", source: "capture", tags: ["capture:gorgias"] }],
+      })) as typeof fetch);
+    const run = await client.lastRun("gr:1", "support-reply");
+    expect(run).toMatchObject({ source: "capture", tags: ["capture:gorgias"] });
   });
 
   it("has no run to offer when the lookup fails or comes back empty", async () => {

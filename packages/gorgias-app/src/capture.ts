@@ -16,6 +16,10 @@ export interface MessageSnapshot {
   fromAgent: boolean;
   senderName?: string | null;
   senderEmail?: string | null;
+  /** Gorgias' `sent_datetime`: null on a message that was created but has not gone out yet. */
+  sentAt?: string | null;
+  /** Gorgias' `failed_datetime`, or the sending error it recorded. */
+  failedAt?: string | null;
   createdAt?: string | null;
   /** Message body as text. Gorgias also returns HTML; the text is what the human read. */
   text: string;
@@ -41,7 +45,7 @@ export interface AppSettings {
   baseUrl: string;
   /** Where this app is served: the widget data URL, the reason picker and the draft page. */
   appUrl: string;
-  /** Shared secret Gorgias puts in the integration URL; links carry it back. Empty = no check. */
+  /** Shared secret Gorgias puts in the integration URL and the pages post back. Required to boot. */
   widgetToken: string | null;
   agent: string;
   /** Hold a changed send until a reason is picked, instead of filing it without one. */
@@ -113,6 +117,27 @@ export function settingsFrom(raw: Record<string, unknown>): AppSettings {
   };
 }
 
+/**
+ * Why the app cannot start. Passwords are the only authentication a Gorgias integration can carry,
+ * so a deployment that forgets its token would leave every route open to anyone who knows the URL:
+ * that is a misconfiguration to refuse, not a default to run with.
+ */
+export function configError(settings: AppSettings): string | null {
+  if (!settings.widgetToken) {
+    return "WIDGET_TOKEN is required: without it anyone who knows the app's URL could file captures. Set it here and in the integration URL install.mjs registers.";
+  }
+  if (settings.widgetToken.length < 24) {
+    return "WIDGET_TOKEN must be at least 24 characters: it is the only thing standing in front of the app's routes.";
+  }
+  if (!settings.appUrl) {
+    return "APP_URL is required: the widget links the agent clicks are built from it.";
+  }
+  if (!/^https:\/\//.test(settings.appUrl)) {
+    return "APP_URL must be https: the integration URL and its token travel in plaintext over http.";
+  }
+  return null;
+}
+
 /** With a scope tag configured, a ticket without it is never read at all. */
 export function inScope(tags: readonly string[], settings: AppSettings): boolean {
   if (!settings.scopeTag) return true;
@@ -121,18 +146,25 @@ export function inScope(tags: readonly string[], settings: AppSettings): boolean
 
 /**
  * Where the draft came from. Gorgias gives an app no handle on the reply box, so a draft is known
- * because something told us about it: the drafting agent's own recorded run (`externalId`
- * `gr:<ticket id>`, origin `recorded`), a drafting agent announcing the text it put in the composer
- * (`inserted`), or the agent pasting the text into the Overturn page the widget links to (`manual`).
+ * because something said so: the drafting agent's own recorded run (`recorded`), the agent telling
+ * the Overturn page that an assist put the text in the composer (`assist`), or the agent saying the
+ * text is their own (`human`). An unknown source stays `unknown` rather than being filed as AI.
  */
-export type DraftOrigin = "recorded" | "inserted" | "manual";
+export type DraftOrigin = "recorded" | "assist" | "human" | "unknown";
 
 export interface DraftState {
   text: string;
   origin: DraftOrigin;
   runId?: string;
   model?: string | null;
+  /** When the draft appeared in front of the agent; `secondsToSend` counts from here. */
   at: number;
+  /**
+   * The decision fields as they stood when this draft first appeared. Frozen for the draft's whole
+   * life: an agent editing a reserve while the AI's text sits in the reply box is exactly the change
+   * the diff exists to catch, so the fields must not be re-read after this.
+   */
+  fields: Record<string, unknown>;
 }
 
 /** The run a drafting agent recorded with the Overturn SDK. */
@@ -142,33 +174,57 @@ export interface RecordedRun {
   output: unknown;
   model?: string | null;
   endedAt?: string | null;
+  /** `source` as `/v1/runs` reports it: `capture` means Overturn synthesized the run itself. */
+  source?: string | null;
+  tags?: readonly string[];
 }
 
 /**
  * The draft as the drafting agent recorded it. `at` is when the run ended, so a reply that predates
- * the draft is never mistaken for a send of it (see handler.ts).
+ * the draft is never mistaken for a send of it.
  */
-export function draftFromRun(run: RecordedRun, now = Date.now()): DraftState | null {
+export function draftFromRun(
+  run: RecordedRun,
+  opts: { now?: number; fields?: Record<string, unknown> } = {},
+): DraftState | null {
   if (typeof run.output !== "string" || !run.output.trim()) return null;
+  if (discardRun(run)) return null;
   const ended = run.endedAt ? Date.parse(run.endedAt) : Number.NaN;
   return {
     text: run.output,
     origin: "recorded",
     runId: run.id,
     model: run.model ?? null,
-    at: Number.isFinite(ended) ? ended : now,
+    at: Number.isFinite(ended) ? ended : (opts.now ?? Date.now()),
+    fields: opts.fields ?? {},
   };
+}
+
+/**
+ * A run capture made itself is evidence of a past correction, not a draft for this reply: its output
+ * is a reply that already went out. A run the agent recorded during an earlier pass is stale for the
+ * same reason, once the app has already filed a reply on this ticket.
+ */
+export function discardRun(run: RecordedRun, consumed?: readonly string[]): boolean {
+  if (consumed?.includes(run.id)) return true;
+  if (run.source === "capture") return true;
+  return (run.tags ?? []).some((t) => t.startsWith("capture:"));
 }
 
 /** A draft offered to the app by hand (the widget's draft page: paste what is in the reply box). */
 export function draftFromHand(
   text: string,
   settings: AppSettings,
-  opts: { origin?: DraftOrigin; now?: number } = {},
+  opts: { origin?: DraftOrigin; now?: number; fields?: Record<string, unknown> } = {},
 ): DraftState | null {
   const trimmed = text.trim();
   if (trimmed.length < settings.minDraftChars) return null;
-  return { text: trimmed, origin: opts.origin ?? "manual", at: opts.now ?? Date.now() };
+  return {
+    text: trimmed,
+    origin: opts.origin ?? "human",
+    at: opts.now ?? Date.now(),
+    fields: opts.fields ?? {},
+  };
 }
 
 function role(m: MessageSnapshot): CaptureMessage["role"] {
@@ -184,7 +240,7 @@ export function contextFrom(ticket: TicketSnapshot): CaptureMessage[] {
       role: role(m),
       author: m.senderEmail ?? m.senderName ?? null,
       content: normalizeCaptureText(m.text),
-      at: m.createdAt ?? null,
+      at: m.sentAt ?? m.createdAt ?? null,
     }));
   const order = Object.entries(ticket.order).filter(([, v]) => v !== null && v !== undefined);
   if (order.length === 0) return thread;
@@ -216,12 +272,28 @@ export function stripHtml(html: string): string {
   );
 }
 
+/**
+ * A reply the app may diff a draft against: an agent's own message that Gorgias actually sent.
+ * Gorgias decouples creation from sending, so an outbound message with no `sent_datetime` has not
+ * reached the customer yet and an edit to it would be recorded before the fact. A message that
+ * failed to send is not a reply either.
+ */
+export function isSentReply(m: MessageSnapshot): boolean {
+  if (!m.fromAgent || m.failedAt) return false;
+  return Boolean(m.sentAt);
+}
+
+/** An internal note that is on the ticket, whether or not the installer captures notes. */
+export function isInternalNote(m: MessageSnapshot): boolean {
+  return !m.public;
+}
+
 export interface PendingSend {
   text: string;
   /** Gorgias `message.public`: false on an internal note. */
   public: boolean;
   fields: Record<string, unknown>;
-  /** The Gorgias message the app will not look at twice. */
+  /** The Gorgias message this capture is about; the app never looks at it twice. */
   messageId: number | string | null;
 }
 
@@ -232,14 +304,13 @@ export type SendDecision =
   | { action: "need-reason"; body: CaptureCreate; changedFields: string[] };
 
 /**
- * What to do when a message lands in the thread. Pure: the Gorgias glue only forwards the answer.
+ * What to do when a sent reply lands in the thread. Pure: the Gorgias glue only forwards the answer.
  * Gorgias has no submit hook to block, so `need-reason` is a hold, not a wall: the capture is kept
  * until the agent picks a reason, and the send goes out either way (see handler.ts).
  */
 export function decideOnSend(input: {
   ticket: TicketSnapshot;
-  draft: DraftState | null;
-  draftFields: Record<string, unknown>;
+  draft: DraftState;
   send: PendingSend;
   /** The picked reason code, required for a changed send when requireReason is on. */
   reasonCode: string | null;
@@ -254,12 +325,11 @@ export function decideOnSend(input: {
   const sentText = normalizeCaptureText(send.text);
   if (!sentText) return { action: "skip", why: "empty" };
   if (!send.public && !settings.captureInternalNotes) return { action: "skip", why: "internal-note" };
-  if (!draft) return { action: "skip", why: "no-draft" };
 
   const hasFields = settings.decisionFields.length > 0;
   const draftAnswer: CaptureAnswer = {
     text: normalizeCaptureText(draft.text),
-    ...(hasFields ? { fields: input.draftFields } : {}),
+    ...(hasFields ? { fields: draft.fields } : {}),
   };
   const sentAnswer: CaptureAnswer = { text: sentText, ...(hasFields ? { fields: send.fields } : {}) };
   const diff = diffCaptureAnswers(draftAnswer, sentAnswer);
@@ -285,6 +355,7 @@ export function decideOnSend(input: {
     tags: [`draft:${draft.origin}`, send.public ? "public-reply" : "internal-note"],
     metadata: {
       customer: ticket.customerEmail ?? ticket.customerName ?? null,
+      gorgiasMessageId: send.messageId ?? null,
       ...(Object.keys(order).length > 0 ? { order } : {}),
     },
   };
@@ -303,7 +374,7 @@ export function decideOnSend(input: {
 /**
  * Short status line for the sidebar. Gorgias shows an app no reply box to watch, so a recorded run
  * and an announced insertion are the same story from here: the drafting agent's text is in the
- * reply box. `manual` is the agent's own text, offered by hand.
+ * reply box. `human` is the agent's own text, and an unknown source says so rather than guessing.
  */
 export function statusLine(
   d: DraftState | null,
@@ -315,7 +386,12 @@ export function statusLine(
   }
   if (!d) return "Waiting for a draft";
   const words = d.text.trim().split(/\s+/).length;
-  const from = { recorded: "inserted", inserted: "inserted", manual: "marked by you" }[d.origin];
+  const from = {
+    recorded: "inserted",
+    assist: "inserted",
+    human: "marked by you",
+    unknown: "saved (source unknown)",
+  }[d.origin];
   return `Draft ${from} · ${words} words`;
 }
 

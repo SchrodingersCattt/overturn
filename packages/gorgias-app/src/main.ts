@@ -3,6 +3,7 @@ import { configFrom } from "./config";
 import { createGorgiasClient } from "./gorgias";
 import { createHandler, type Handler } from "./handler";
 import { createOverturnClient } from "./overturn";
+import { createFileStore } from "./store";
 
 const MAX_BODY = 256 * 1024;
 
@@ -45,6 +46,8 @@ const handler = createHandler({
   settings,
   gorgias: createGorgiasClient(config.gorgias, settings),
   overturn: createOverturnClient(config.overturn),
+  // Durable by default: a restart must not lose a draft, a reason or a capture waiting for one.
+  store: createFileStore(process.env.DATA_FILE ?? "./data/gorgias-state.json"),
 });
 
 const server = createServer((req, res) => {

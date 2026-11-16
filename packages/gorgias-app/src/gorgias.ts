@@ -1,9 +1,9 @@
 import { type AppSettings, type MessageSnapshot, stripHtml, type TicketSnapshot } from "./capture";
 
-/** The slice of the Gorgias REST API this app reads. https://developers.gorgias.com/reference */
+/** The Gorgias REST API: the ticket's fields, and the messages that say what was actually sent. */
 export interface GorgiasClient {
-  /** The ticket as the agent sees it: thread, customer, tags and the fields in the sidebar. */
   ticket(id: string | number): Promise<TicketSnapshot>;
+  messages(id: string | number): Promise<MessageSnapshot[]>;
 }
 
 export interface GorgiasCredentials {
@@ -44,6 +44,9 @@ interface ApiMessage {
   from_agent?: boolean | null;
   sender?: { email?: string | null; name?: string | null } | null;
   created_datetime?: string | null;
+  sent_datetime?: string | null;
+  failed_datetime?: string | null;
+  last_sending_error?: unknown;
   stripped_text?: string | null;
   body_text?: string | null;
   body_html?: string | null;
@@ -65,7 +68,11 @@ export function messageText(m: ApiMessage): string {
   return m.body_html ? stripHtml(m.body_html) : "";
 }
 
-/** Gorgias messages are already in order, oldest first; the app keeps that order. */
+/**
+ * Gorgias decouples creating a message from sending it: `sent_datetime` is filled only once the
+ * message actually went out, and `failed_datetime` / `last_sending_error` say when it did not. The
+ * app keeps both, because a capture must never be recorded for a reply the customer never got.
+ */
 export function messageSnapshotFrom(m: ApiMessage): MessageSnapshot {
   return {
     id: m.id ?? undefined,
@@ -73,6 +80,8 @@ export function messageSnapshotFrom(m: ApiMessage): MessageSnapshot {
     fromAgent: m.from_agent === true,
     senderName: m.sender?.name ?? null,
     senderEmail: m.sender?.email ?? null,
+    sentAt: m.sent_datetime ?? null,
+    failedAt: m.failed_datetime ?? (m.last_sending_error ? "sending-error" : null),
     createdAt: m.created_datetime ?? null,
     text: messageText(m),
   };
@@ -119,17 +128,32 @@ export function createGorgiasClient(
 ): GorgiasClient {
   const base = gorgiasBase(creds.domain);
   const authorization = `Basic ${Buffer.from(`${creds.email}:${creds.apiKey}`, "utf8").toString("base64")}`;
+
+  async function get<T>(path: string, what: string): Promise<T> {
+    const res = await fetchImpl(`${base}${path}`, {
+      headers: { Authorization: authorization, Accept: "application/json" },
+    });
+    if (!res.ok) throw new GorgiasError(`Gorgias returned ${res.status} for ${what}`, res.status);
+    return (await res.json()) as T;
+  }
+
   return {
     async ticket(id) {
-      const url = `${base}/api/tickets/${encodeURIComponent(String(id))}`;
-      const res = await fetchImpl(url, {
-        headers: { Authorization: authorization, Accept: "application/json" },
-      });
-      if (!res.ok) {
-        throw new GorgiasError(`Gorgias returned ${res.status} for ticket ${id}`, res.status);
-      }
-      const ticket = (await res.json()) as ApiTicket;
-      return ticketSnapshotFrom(ticket, settings, { base });
+      return ticketSnapshotFrom(
+        await get<ApiTicket>(`/api/tickets/${encodeURIComponent(String(id))}`, `ticket ${id}`),
+        settings,
+        { base },
+      );
+    },
+    /**
+     * The flat message list, newest first: the small read the send check needs. `sent_datetime` is
+     * what tells a reply that went out from one that is still being created.
+     */
+    async messages(id) {
+      const query = `ticket_id=${encodeURIComponent(String(id))}&order_by=created_datetime%3Adesc&limit=10`;
+      const body = await get<{ data?: ApiMessage[] }>(`/api/messages?${query}`, `messages of ticket ${id}`);
+      // The list is newest first; the diff wants the thread the way the human read it.
+      return (body.data ?? []).map(messageSnapshotFrom).reverse();
     },
   };
 }

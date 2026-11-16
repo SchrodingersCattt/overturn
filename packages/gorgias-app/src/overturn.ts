@@ -25,6 +25,9 @@ interface RunRow {
   output?: unknown;
   model?: unknown;
   endedAt?: unknown;
+  /** What produced the run; `capture` marks a run Overturn synthesized for an earlier correction. */
+  source?: unknown;
+  tags?: unknown;
 }
 
 /** The Overturn API, over fetch: the drafting agent's recorded run, and the capture itself. */
@@ -37,20 +40,26 @@ export function createOverturnClient(
   return {
     async lastRun(externalId, agent) {
       // The drafting agent may have recorded its run itself; if it did, the draft is its output.
-      const query = `externalId=${encodeURIComponent(externalId)}&agent=${encodeURIComponent(agent)}&limit=1`;
+      // `source` and `tags` come back too: a run that capture synthesized is not a draft (see
+      // discardRun), it is the frozen answer of a correction that already happened.
+      const query = `externalId=${encodeURIComponent(externalId)}&agent=${encodeURIComponent(agent)}&limit=5`;
       const res = await fetchImpl(`${base}/v1/runs?${query}`, {
         headers: { Authorization: authorization, Accept: "application/json" },
       });
       if (!res.ok) return null;
       const body = (await res.json()) as { items?: RunRow[] } | null;
-      const run = body?.items?.[0];
-      if (!run || typeof run.id !== "string") return null;
+      // Newest first: take the newest run the drafting agent actually recorded for this thread.
+      const rows = (body?.items ?? []).filter((r): r is RunRow & { id: string } => typeof r.id === "string");
+      const run = rows[0];
+      if (!run) return null;
       const found: RecordedRun = {
         id: run.id,
         agent: typeof run.agent === "string" ? run.agent : agent,
         output: run.output,
         model: typeof run.model === "string" ? run.model : null,
         endedAt: typeof run.endedAt === "string" ? run.endedAt : null,
+        source: typeof run.source === "string" ? run.source : null,
+        tags: Array.isArray(run.tags) ? run.tags.filter((t): t is string => typeof t === "string") : [],
       };
       return found;
     },

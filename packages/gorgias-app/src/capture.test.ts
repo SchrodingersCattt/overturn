@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  configError,
   contextFrom,
   DEFAULT_SETTINGS,
   decideOnSend,
+  discardRun,
   draftFromHand,
   draftFromRun,
   inScope,
+  isSentReply,
   quickReasons,
   settingsFrom,
   statusLine,
@@ -47,6 +50,14 @@ const ticket: TicketSnapshot = {
 
 const recorded = { id: "0f6f0f1e-0000-4000-8000-000000000001", agent: "support-reply", output: draftText };
 
+const draft = {
+  text: draftText,
+  origin: "recorded" as const,
+  at: 0,
+  fields: {},
+  runId: recorded.id,
+};
+
 describe("settings", () => {
   it("parses the app's settings, the same keys the Zendesk app uses", () => {
     const s = settingsFrom({
@@ -82,8 +93,22 @@ describe("settings", () => {
     expect(settingsFrom({})).toEqual(DEFAULT_SETTINGS);
     expect(DEFAULT_SETTINGS.reasonPack).toBe("support");
     expect(DEFAULT_SETTINGS.requireReason).toBe(true);
-    expect(DEFAULT_SETTINGS.appUrl).toBe("");
     expect(settingsFrom({ reason_pack: "garbage" }).reasonPack).toBe("support");
+  });
+
+  it("refuses to boot without a token to put in front of the routes", () => {
+    const ready = settingsFrom({ widget_token: "s".repeat(32), app_url: "https://app.overturn.test" });
+    expect(configError(ready)).toBeNull();
+    expect(configError(settingsFrom({ app_url: "https://app.overturn.test" }))).toMatch(
+      /WIDGET_TOKEN is required/,
+    );
+    expect(
+      configError(settingsFrom({ widget_token: "short", app_url: "https://app.overturn.test" })),
+    ).toMatch(/at least 24 characters/);
+    expect(configError(settingsFrom({ widget_token: "s".repeat(32) }))).toMatch(/APP_URL is required/);
+    expect(
+      configError(settingsFrom({ widget_token: "s".repeat(32), app_url: "http://app.overturn.test" })),
+    ).toMatch(/must be https/);
   });
 
   it("a scope tag limits which tickets are read at all", () => {
@@ -104,24 +129,62 @@ describe("settings", () => {
 
 describe("the draft", () => {
   it("is the drafting agent's recorded run, at the time that run ended", () => {
-    const draft = draftFromRun({ ...recorded, endedAt: "2026-10-01T12:00:00Z" }, 1);
-    expect(draft).toEqual({
+    const d = draftFromRun({ ...recorded, endedAt: "2026-10-01T12:00:00Z" }, { now: 1 });
+    expect(d).toEqual({
       text: draftText,
       origin: "recorded",
       runId: recorded.id,
       model: null,
       at: Date.parse("2026-10-01T12:00:00Z"),
+      fields: {},
     });
-    expect(draftFromRun({ ...recorded, output: "  " }, 1)).toBeNull();
-    expect(draftFromRun({ ...recorded, output: { text: draftText } }, 1)).toBeNull();
-    expect(draftFromRun({ ...recorded, endedAt: "not a date" }, 7)?.at).toBe(7);
+    expect(draftFromRun({ ...recorded, output: "  " }, { now: 1 })).toBeNull();
+    expect(draftFromRun({ ...recorded, output: { text: draftText } }, { now: 1 })).toBeNull();
+    expect(draftFromRun({ ...recorded, endedAt: "not a date" }, { now: 7 })?.at).toBe(7);
+  });
+
+  it("keeps the decision fields it was created with, so the diff has a baseline", () => {
+    expect(draftFromRun(recorded, { fields: { status: "processing" } })?.fields).toEqual({
+      status: "processing",
+    });
+  });
+
+  it("never comes from a run capture synthesized, or from one already spent", () => {
+    expect(discardRun({ ...recorded, source: "capture" })).toBe(true);
+    expect(discardRun({ ...recorded, tags: ["capture:gorgias"] })).toBe(true);
+    expect(discardRun(recorded)).toBe(false);
+    // A run used for an earlier reply is history, not the draft for this one.
+    expect(discardRun(recorded, [recorded.id])).toBe(true);
+    expect(discardRun(recorded, ["another-run"])).toBe(false);
   });
 
   it("can be offered by hand when nothing recorded it, and is not a greeting", () => {
     const s = settingsFrom({ min_draft_chars: "40" });
-    expect(draftFromHand(draftText, s, { now: 5 })).toEqual({ text: draftText, origin: "manual", at: 5 });
-    expect(draftFromHand(draftText, s, { origin: "inserted" })?.origin).toBe("inserted");
+    expect(draftFromHand(draftText, s, { now: 5 })).toEqual({
+      text: draftText,
+      origin: "human",
+      at: 5,
+      fields: {},
+    });
+    expect(draftFromHand(draftText, s, { origin: "assist" })?.origin).toBe("assist");
+    // An unknown source stays unknown: it is not silently counted as AI.
+    expect(draftFromHand(draftText, s, { origin: "unknown" })?.origin).toBe("unknown");
     expect(draftFromHand("Hi Dana!", s)).toBeNull();
+  });
+});
+
+describe("a reply", () => {
+  it("is only a reply once Gorgias says it was sent", () => {
+    const base = { public: true, fromAgent: true, text: draftText, id: 9 };
+    expect(isSentReply({ ...base, sentAt: "2026-10-01T13:00:00Z" })).toBe(true);
+    // Created but not sent yet: the customer has not seen it, so it is not a reply.
+    expect(isSentReply({ ...base, createdAt: "2026-10-01T13:00:00Z" })).toBe(false);
+    // A failed send is not a reply either.
+    expect(isSentReply({ ...base, sentAt: "2026-10-01T13:00:00Z", failedAt: "2026-10-01T13:00:05Z" })).toBe(
+      false,
+    );
+    // A customer's message is never the agent's reply.
+    expect(isSentReply({ ...base, fromAgent: false, sentAt: "2026-10-01T13:00:00Z" })).toBe(false);
   });
 });
 
@@ -161,13 +224,15 @@ describe("context", () => {
 
 describe("the capture payload", () => {
   it("is what POST /v1/capture expects, keyed to the Gorgias ticket", () => {
-    const draft = { ...draftFromRun({ ...recorded, endedAt: "2026-10-01T12:00:00Z" })!, at: 1_000_000 };
-    const sent = `${draftText} Heard back from the warehouse: it ships on Monday.`;
     const decision = decideOnSend({
       ticket,
-      draft,
-      draftFields: {},
-      send: { text: sent, public: true, fields: {}, messageId: 9 },
+      draft: { ...draft, at: 1_000_000 },
+      send: {
+        text: `${draftText} Heard back from the warehouse: it ships on Monday.`,
+        public: true,
+        fields: {},
+        messageId: 9,
+      },
       reasonCode: "wrong_amount_or_date",
       reason: "Warehouse ships Mondays, not same day",
       actor: "ray@acme.com",
@@ -185,7 +250,7 @@ describe("the capture payload", () => {
       subject: "Cracked lid in order 4509",
       context: contextFrom(ticket),
       draft: { text: draftText },
-      sent: { text: sent },
+      sent: { text: `${draftText} Heard back from the warehouse: it ships on Monday.` },
       reason: "Warehouse ships Mondays, not same day",
       reasonCode: "wrong_amount_or_date",
       secondsToSend: 2.5,
@@ -193,16 +258,24 @@ describe("the capture payload", () => {
       draftModel: null,
       url: "https://acme.gorgias.com/app/tickets/48213",
       tags: ["draft:recorded", "public-reply"],
-      metadata: { customer: "dana@example.com", order: { "Order id": "4509", "Order status": "processing" } },
+      metadata: {
+        customer: "dana@example.com",
+        gorgiasMessageId: 9,
+        order: { "Order id": "4509", "Order status": "processing" },
+      },
     });
   });
 
-  it("freezes decision fields beside the text, exactly like Zendesk", () => {
+  it("freezes the decision fields the draft was created with", () => {
     const settings = settingsFrom({ decision_fields: "status:status, 4509:order_id" });
     const decision = decideOnSend({
       ticket: { ...ticket, fields: { status: "replacement_sent", order_id: "4509" } },
-      draft: { text: draftText, origin: "recorded", at: 0 },
-      draftFields: { status: "processing", order_id: "4509" },
+      draft: {
+        text: draftText,
+        origin: "recorded",
+        at: 0,
+        fields: { status: "processing", order_id: "4509" },
+      },
       send: {
         text: draftText,
         public: true,
@@ -230,8 +303,7 @@ describe("the capture payload", () => {
   it("is an approve when the reply goes out as drafted: no reason code, whatever was picked", () => {
     const decision = decideOnSend({
       ticket,
-      draft: { text: draftText, origin: "manual", at: 0 },
-      draftFields: {},
+      draft: { text: draftText, origin: "human", at: 0, fields: {} },
       send: { text: `  ${draftText}\n`, public: true, fields: {}, messageId: 9 },
       reasonCode: "wrong_answer",
       reason: "picked by mistake",
@@ -241,14 +313,13 @@ describe("the capture payload", () => {
     });
     expect(decision).toMatchObject({ action: "capture", changed: false, changedFields: [] });
     expect(decision.action === "capture" ? decision.body.reasonCode : "x").toBeNull();
-    expect(decision.action === "capture" ? decision.body.tags : []).toEqual(["draft:manual", "public-reply"]);
+    expect(decision.action === "capture" ? decision.body.tags : []).toEqual(["draft:human", "public-reply"]);
   });
 
   it("holds a changed reply until a reason is picked, and keeps the body ready", () => {
     const decision = decideOnSend({
       ticket,
-      draft: { text: draftText, origin: "recorded", at: 0 },
-      draftFields: {},
+      draft,
       send: { text: `${draftText} Ask again if not.`, public: true, fields: {}, messageId: 9 },
       reasonCode: null,
       reason: "",
@@ -263,28 +334,24 @@ describe("the capture payload", () => {
   });
 
   it("files a changed reply without a reason when require_reason is off", () => {
-    const settings = settingsFrom({ require_reason: "false" });
     const decision = decideOnSend({
       ticket,
-      draft: { text: draftText, origin: "recorded", at: 0 },
-      draftFields: {},
+      draft,
       send: { text: "Something else entirely.", public: true, fields: {}, messageId: 9 },
       reasonCode: null,
       reason: "",
       actor: null,
-      settings,
+      settings: settingsFrom({ require_reason: "false" }),
       now: 10,
     });
     expect(decision).toMatchObject({ action: "capture", changed: true });
   });
 
   it("skips internal notes unless the installer asked for them", () => {
-    const send = { text: draftText, public: false, fields: {}, messageId: 9 };
     const input = {
       ticket,
-      draft: { text: draftText, origin: "recorded" as const, at: 0 },
-      draftFields: {},
-      send,
+      draft,
+      send: { text: draftText, public: false, fields: {}, messageId: 9 },
       reasonCode: null,
       reason: "",
       actor: null,
@@ -300,44 +367,33 @@ describe("the capture payload", () => {
     ]);
   });
 
-  it("skips an empty send and a ticket with no draft", () => {
-    const base = {
+  it("skips an empty send", () => {
+    const decision = decideOnSend({
       ticket,
-      draft: { text: draftText, origin: "recorded" as const, at: 0 },
-      draftFields: {},
+      draft,
+      send: { text: "  \n ", public: true, fields: {}, messageId: 9 },
       reasonCode: null,
       reason: "",
       actor: null,
       settings: DEFAULT_SETTINGS,
       now: 1,
-    };
-    expect(
-      decideOnSend({ ...base, send: { text: "  \n ", public: true, fields: {}, messageId: 9 } }),
-    ).toEqual({
-      action: "skip",
-      why: "empty",
     });
-    expect(
-      decideOnSend({
-        ...base,
-        draft: null,
-        send: { text: draftText, public: true, fields: {}, messageId: 9 },
-      }),
-    ).toEqual({ action: "skip", why: "no-draft" });
+    expect(decision).toEqual({ action: "skip", why: "empty" });
   });
 });
 
 describe("the status line", () => {
-  it("says what is in the reply box, in words", () => {
+  it("says what is in the reply box, in words, and never invents a source", () => {
     expect(statusLine(null, null)).toBe("Waiting for a draft");
-    expect(statusLine({ text: "one two three", origin: "recorded", at: 1 }, null)).toBe(
+    expect(statusLine({ ...draft, text: "one two three" }, null)).toBe("Draft inserted · 3 words");
+    expect(statusLine({ ...draft, text: "one two three", origin: "assist" }, null)).toBe(
       "Draft inserted · 3 words",
     );
-    expect(statusLine({ text: "one two three", origin: "inserted", at: 1 }, null)).toBe(
-      "Draft inserted · 3 words",
-    );
-    expect(statusLine({ text: "one two", origin: "manual", at: 1 }, null)).toBe(
+    expect(statusLine({ ...draft, text: "one two", origin: "human" }, null)).toBe(
       "Draft marked by you · 2 words",
+    );
+    expect(statusLine({ ...draft, text: "one two", origin: "unknown" }, null)).toBe(
+      "Draft saved (source unknown) · 2 words",
     );
     expect(statusLine(null, { kind: "approve", changed: false })).toBe("Sent as drafted · approved");
     expect(statusLine(null, { kind: "edit", changed: true })).toBe("Captured · edit saved as a case");

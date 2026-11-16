@@ -28,6 +28,14 @@
           },
           {
             "type": "text",
+            "title": "Put the draft text in Overturn",
+            "path": "draft_action",
+            "meta": {
+              "link": "{{draft_url}}"
+            }
+          },
+          {
+            "type": "text",
             "title": "Wrong answer",
             "path": "reason_wrong_answer",
             "meta": {
