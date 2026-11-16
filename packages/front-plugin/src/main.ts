@@ -1,6 +1,14 @@
 import Front, { HttpVerbsEnum } from "@frontapp/plugin-sdk";
 import type { CaptureCreate, CaptureResult } from "@overturn-ai/shared";
-import { type AppSettings, quickReasons, settingsFrom } from "./capture";
+import {
+  type AppSettings,
+  apiKeyInParams,
+  type DraftOrigin,
+  draftTag,
+  draftTagBasis,
+  quickReasons,
+  settingsFrom,
+} from "./capture";
 import { type CapturePost, createWatcher, POLL_INTERVAL_MS } from "./watch";
 
 /** A capture Overturn refused, carrying the status the panel shows. */
@@ -13,31 +21,23 @@ class CaptureError extends Error {
   }
 }
 
-/** Sends the capture. With a project key in the plugin URL it goes straight to `POST /v1/capture`;
- *  without one, Front relays it and holds the credential, so it never sits in the plugin. */
+/**
+ * Sends the capture through Front's relay. The plugin page is public — a key in its URL lands in
+ * browser history, `Referer` headers and proxy logs — so the credential lives with the endpoint:
+ * `overturn_base_url` points at your own proxy (see the README) or at an Overturn endpoint that
+ * takes the workspace's key server-side. Nothing here holds a key.
+ */
 function captureClient(settings: AppSettings): CapturePost {
   const url = `${settings.baseUrl}/v1/capture`;
-  if (!settings.apiKey) {
-    return async (body: CaptureCreate): Promise<CaptureResult> => {
-      const response = await Front.relayHttp({
-        verb: HttpVerbsEnum.POST,
-        url,
-        headers: { "Content-Type": "application/json" },
-        body,
-      });
-      if (response.status >= 300) throw new CaptureError(`relay ${response.status}`, response.status);
-      return response.body as CaptureResult;
-    };
-  }
-  const apiKey = settings.apiKey;
   return async (body: CaptureCreate): Promise<CaptureResult> => {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(body),
+    const response = await Front.relayHttp({
+      verb: HttpVerbsEnum.POST,
+      url,
+      headers: { "Content-Type": "application/json" },
+      body,
     });
-    if (!response.ok) throw new CaptureError(`capture ${response.status}`, response.status);
-    return (await response.json()) as CaptureResult;
+    if (response.status >= 300) throw new CaptureError(`relay ${response.status}`, response.status);
+    return response.body as CaptureResult;
   };
 }
 
@@ -67,8 +67,16 @@ async function main(): Promise<void> {
   const root = document.getElementById("app");
   if (!root) return;
   const params = new URLSearchParams(location.search);
-  const settings = settingsFrom(Object.fromEntries(params.entries()));
+  const paramObject = Object.fromEntries(params.entries());
+  const settings = settingsFrom(paramObject);
   const debug = params.get("debug") === "true";
+  if (apiKeyInParams(paramObject)) {
+    console.warn(
+      "overturn: the plugin no longer reads an API key from its URL — a key there ends up in browser " +
+        "history, Referer headers and logs. Remove `overturn_api_key` and point `overturn_base_url` at " +
+        "your own proxy, which holds the key server-side (see the README).",
+    );
+  }
 
   const watcher = createWatcher({
     post: captureClient(settings),
@@ -80,10 +88,17 @@ async function main(): Promise<void> {
   // One click picks the reason (what the scorecard counts); the note is optional detail.
   const quick = el("div", { class: "quick", role: "radiogroup", "aria-label": "Why did you change it?" });
   const note = el("textarea", { class: "reason", rows: "2", placeholder: "Anything else? Optional." });
-  const mark = el("button", { type: "button", class: "link" }, "Use the current text as the draft");
+  // Who wrote the draft is the teammate's word, never ours: the detector only sees text move.
+  const mark = el("button", { type: "button", class: "link" }, "This text is the draft and I wrote it");
+  const markAi = el("button", { type: "button", class: "link" }, "This text is the draft, an AI wrote it");
+  const origin = el(
+    "div",
+    { class: "origin" },
+    "A draft that appears here is tagged draft:unknown unless you say who wrote it.",
+  );
   const detail = el("div", { class: "detail" }, "");
   const debugLine = el("pre", { class: "debug" }, "");
-  root.append(status, quick, note, mark, detail);
+  root.append(status, origin, quick, note, mark, markAi, detail);
   if (debug) root.append(debugLine);
 
   let picked: string | null = null;
@@ -106,13 +121,18 @@ async function main(): Promise<void> {
     chips.push(chip);
     quick.appendChild(chip);
   }
-  mark.addEventListener("click", () => void watcher.markDraft().then(render));
+  mark.addEventListener("click", () => void watcher.markDraft("manual").then(render));
+  markAi.addEventListener("click", () => void watcher.markDraft("assist").then(render));
 
   const render = (): void => {
     const state = watcher.state();
     status.textContent = state.status;
     status.classList.toggle("held", state.held);
-    for (const node of [quick, note, mark]) node.hidden = !state.watching;
+    for (const node of [quick, note, mark, markAi]) node.hidden = !state.watching;
+    origin.hidden = !state.watching;
+    origin.textContent = state.draft
+      ? draftTagBasisLine(state.draft.origin)
+      : "A draft that appears here is tagged draft:unknown unless you say who wrote it.";
     if (state.last?.kind === "captured" && state.last.caseTitle) {
       detail.textContent = `Case: ${state.last.caseTitle}`;
     } else if (state.last?.kind === "failed") {
@@ -135,6 +155,11 @@ async function main(): Promise<void> {
   });
   window.setInterval(() => void watcher.poll().then(render), POLL_INTERVAL_MS);
   render();
+}
+
+/** How the run will be tagged, in the teammate's words. */
+function draftTagBasisLine(origin: DraftOrigin): string {
+  return `Tagged ${draftTag(origin)} — ${draftTagBasis(origin)}.`;
 }
 
 const started = (): void => {

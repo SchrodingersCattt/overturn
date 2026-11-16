@@ -95,12 +95,6 @@ export interface AppSettings {
   scopeTag: string | null;
   /** Which quick-pick reasons the teammate sees: the claims pack or the vendor-neutral support pack. */
   reasonPack: ReasonPack;
-  /**
-   * Project API key, read from the plugin URL. When set, the capture goes straight to
-   * `POST /v1/capture`; without it the request is relayed through Front, which holds the
-   * credential as the app's security scheme.
-   */
-  apiKey: string | null;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -112,13 +106,23 @@ export const DEFAULT_SETTINGS: AppSettings = {
   minDraftChars: 80,
   scopeTag: null,
   reasonPack: "support",
-  apiKey: null,
 };
+
+/**
+ * A project key does not belong in a URL: the plugin page is loaded by a browser, so a key in its
+ * query string ends up in history, in `Referer` headers and in whatever logs the page passes
+ * through. This is only here to tell an install that still passes one.
+ */
+export function apiKeyInParams(params: Record<string, string | null | undefined>): boolean {
+  const value = params.overturn_api_key;
+  return typeof value === "string" && value.trim().length > 0;
+}
 
 /**
  * Parses the plugin's settings. Front plugins have no settings object like a ZAF app has: the
  * admin configures the plugin URL in the developer app, so the settings ride in its query string
- * (`?overturn_api_key=…&agent=claims-reply&reason_pack=claims`).
+ * (`?agent=claims-reply&reason_pack=claims`). Credentials do not: captures go through the relay
+ * to `overturn_base_url`, which holds the project key server-side.
  */
 export function settingsFrom(params: Record<string, string | null | undefined>): AppSettings {
   const str = (k: string): string | null => {
@@ -143,7 +147,6 @@ export function settingsFrom(params: Record<string, string | null | undefined>):
     minDraftChars: Number.isFinite(min) && min > 0 ? min : DEFAULT_SETTINGS.minDraftChars,
     scopeTag: str("scope_tag"),
     reasonPack: reasonPackFrom(str("reason_pack")),
-    apiKey: str("overturn_api_key"),
   };
 }
 
@@ -160,10 +163,21 @@ export function inScope(tags: readonly string[], settings: AppSettings): boolean
 /**
  * Where the draft came from. The composer is watched while a draft exists: the first time the
  * draft goes from (nearly) empty to a reply-sized text in one change, that text was inserted
- * (an AI assist, a snippet, a paste), not typed, and it is the draft. The teammate can also mark
- * the current text as the draft by hand.
+ * (an assist, a snippet, a paste), not typed, and it is the draft. The teammate can also mark
+ * the current text as the draft.
+ *
+ * `inserted` and `preloaded` are mechanisms, and a mechanism is not an author: a long paste is
+ * not evidence that a model wrote the text, so neither is tagged `draft:ai`. `assist` and
+ * `manual` are the teammate's word, given in the panel, and they are what the tag says.
  */
-export type DraftOrigin = "inserted" | "manual" | "preloaded";
+export type DraftOrigin = "inserted" | "preloaded" | "assist" | "manual";
+
+/** The `draft:*` tag the scorecard reads: what the teammate said, or nothing at all. */
+export function draftTag(origin: DraftOrigin): string {
+  if (origin === "assist") return "draft:ai";
+  if (origin === "manual") return "draft:manual";
+  return "draft:unknown";
+}
 
 export interface DraftState {
   text: string;
@@ -304,6 +318,21 @@ export function sentFrom(
   return newest;
 }
 
+export function unloadedOutbound(
+  messages: readonly FrontMessageLike[],
+  since: number | null = null,
+): boolean {
+  for (const m of messages) {
+    if (m.status !== "outbound") continue;
+    const at = iso(m.date);
+    if (!at) continue;
+    if (since !== null && Date.parse(at) < since) continue;
+    const content = m.content;
+    if (!content || !textOf({ body: content.body, format: content.type }).trim()) return true;
+  }
+  return false;
+}
+
 /** The conversation's decision fields, by the label the admin configured. */
 export function fieldsFrom(
   conversation: FrontConversationLike,
@@ -387,25 +416,22 @@ export interface PendingSend {
   text: string;
   /** The message it came from, for the panel. */
   messageId?: string | null;
-  /** Who sent it, when Front says: a reply another teammate sent is not this teammate's capture. */
-  authorHandle?: string | null;
+  /** When that message was sent, when Front dated it. */
+  at?: string | null;
+  /**
+   * The address the reply went out from — `Message.from`, which Front documents as the sender
+   * Recipient. On a shared inbox that is the shared address, not the teammate who clicked send,
+   * so it is recorded as provenance and never used to decide who acted.
+   */
+  sentAddress?: string | null;
   fields: Record<string, unknown>;
 }
 
 export type SendDecision =
-  | { action: "skip"; why: "empty" | "no-draft" | "someone-else" }
+  | { action: "skip"; why: "empty" | "no-draft" }
   | { action: "capture"; body: CaptureCreate; changed: boolean; changedFields: string[] }
   | { action: "need-reason"; body: CaptureCreate; changed: true; changedFields: string[] };
 
-function sameActor(authorHandle: string | null | undefined, actor: string | null): boolean {
-  if (!authorHandle || !actor) return true;
-  return authorHandle.toLowerCase() === actor.toLowerCase();
-}
-
-/**
- * What to do once the draft has left the composer: the teammate sent it, or closed it. Pure —
- * the SDK glue only forwards the answer.
- */
 export function decideOnSend(input: {
   conversation: ConversationSnapshot;
   draft: DraftState | null;
@@ -424,7 +450,6 @@ export function decideOnSend(input: {
   const sentText = stripHtml(send.text);
   if (!sentText) return { action: "skip", why: "empty" };
   if (!draft) return { action: "skip", why: "no-draft" };
-  if (!sameActor(send.authorHandle, input.actor)) return { action: "skip", why: "someone-else" };
 
   const hasFields = settings.decisionFields.length > 0;
   const draftAnswer: CaptureAnswer = {
@@ -447,12 +472,24 @@ export function decideOnSend(input: {
     reason: reason || null,
     // A code only counts when something actually changed; a note never flips an approval.
     reasonCode: diff.changed ? reasonCode : null,
-    secondsToSend: Math.max(0, Math.round(((input.now ?? Date.now()) - draft.at) / 100) / 10),
+    // From the draft to the message Front dated, not to the moment the plugin noticed it went.
+    secondsToSend: secondsBetween(draft.at, send.at, input.now ?? Date.now()),
     draftRunId: null,
     draftModel: null,
     url: conversation.url,
-    tags: [`draft:${draft.origin}`, "public-reply"],
-    metadata: { recipient: conversation.recipientEmail ?? conversation.recipientName ?? null },
+    tags: [draftTag(draft.origin), "public-reply"],
+    metadata: {
+      recipient: conversation.recipientEmail ?? conversation.recipientName ?? null,
+      /** Which tag, and why: the panel says the same thing the teammate is looking at. */
+      draftOrigin: draft.origin,
+      draftTagBasis: draftTagBasis(draft.origin),
+      sentMessageId: send.messageId ?? null,
+      sentAt: send.at ?? null,
+      /** The address the reply went out from; not a claim about who clicked send. */
+      sentFrom: send.sentAddress ?? null,
+      actorMatchesSentFrom:
+        send.sentAddress && input.actor ? send.sentAddress.toLowerCase() === input.actor.toLowerCase() : null,
+    },
   };
   if (diff.changed && settings.requireReason && !reasonCode) {
     // Front's plugin SDK has no pre-send hook, so the send has already happened by the time the
@@ -461,6 +498,13 @@ export function decideOnSend(input: {
     return { action: "need-reason", body, changed: true, changedFields: diff.changedFields };
   }
   return { action: "capture", body, changed: diff.changed, changedFields: diff.changedFields };
+}
+
+/** Whole tenths of a second from the draft to the send, never negative and never guessed by recency. */
+function secondsBetween(fromMs: number, sentAt: string | null | undefined, now: number): number {
+  const sentMs = sentAt ? Date.parse(sentAt) : Number.NaN;
+  const end = Number.isFinite(sentMs) ? sentMs : now;
+  return Math.max(0, Math.round((end - fromMs) / 100) / 10);
 }
 
 /** What the panel says about the last thing that happened. */
@@ -482,10 +526,21 @@ export function statusLine(draft: DraftState | null, last: PanelResult | null): 
   const words = trimmed ? trimmed.split(/\s+/).length : 0;
   const from = {
     inserted: "inserted",
-    manual: "marked by you",
     preloaded: "found in the composer",
+    assist: "from an assist, as you said",
+    manual: "marked by you as your own",
   }[draft.origin];
   return `Draft ${from} · ${words} words`;
+}
+
+/**
+ * Why the tag is what it is, in the teammate's words. A mechanism (`inserted`, `preloaded`) is
+ * not an author, so the tag says `unknown` until someone says otherwise — and says so here.
+ */
+export function draftTagBasis(origin: DraftOrigin): string {
+  if (origin === "assist") return "you said an assist wrote it";
+  if (origin === "manual") return "you said you wrote it";
+  return "nobody said who wrote it, so the run is tagged draft:unknown";
 }
 
 /** The chips the teammate clicks, for the installed pack. */

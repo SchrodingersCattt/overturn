@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  apiKeyInParams,
   type ConversationSnapshot,
   contextFrom,
   createDraftDetector,
   DEFAULT_SETTINGS,
   decideOnSend,
+  draftTag,
+  draftTagBasis,
   entriesFrom,
   type FrontConversationLike,
   type FrontMessageLike,
@@ -16,6 +19,7 @@ import {
   snapshotFrom,
   statusLine,
   stripHtml,
+  unloadedOutbound,
 } from "./capture";
 
 const draftText =
@@ -54,11 +58,13 @@ const messages: FrontMessageLike[] = [
 const snapshot = (): ConversationSnapshot =>
   snapshotFrom({ conversation, messages, origin: "https://app.frontapp.com" });
 
+/** The one outbound message of the fixture, for the tests that talk about a loaded send. */
+const sentMessage = messages[1]!;
+
 describe("settings", () => {
   it("reads the plugin URL, which is the only settings surface a Front plugin has", () => {
     const s = settingsFrom({
       overturn_base_url: "https://ov.internal/",
-      overturn_api_key: "ov_live_123",
       agent: "claims-reply",
       require_reason: "false",
       decision_fields: "coverage, reserve ,",
@@ -66,12 +72,20 @@ describe("settings", () => {
       reason_pack: "claims",
     });
     expect(s.baseUrl).toBe("https://ov.internal");
-    expect(s.apiKey).toBe("ov_live_123");
     expect(s.agent).toBe("claims-reply");
     expect(s.requireReason).toBe(false);
     expect(s.decisionFields).toEqual(["coverage", "reserve"]);
     expect(s.minDraftChars).toBe(120);
     expect(s.reasonPack).toBe("claims");
+  });
+
+  it("never takes a project key from the URL, and says so when one is still passed", () => {
+    const params = { overturn_api_key: "ov_live_123", agent: "claims-reply" };
+    // A key in a plugin URL ends up in history, Referer headers and logs: it is not a setting.
+    expect(settingsFrom(params)).toEqual({ ...DEFAULT_SETTINGS, agent: "claims-reply" });
+    expect(apiKeyInParams(params)).toBe(true);
+    expect(apiKeyInParams({ overturn_api_key: "  " })).toBe(false);
+    expect(apiKeyInParams({})).toBe(false);
   });
 
   it("falls back to the defaults, with require_reason on and no key", () => {
@@ -210,6 +224,24 @@ describe("the conversation", () => {
     expect(fieldsFrom(conversation, ["reopened_at"])).toEqual({ reopened_at: "2026-10-02T09:00:00.000Z" });
   });
 
+  it("knows a send whose body Front has not loaded yet", () => {
+    const first = messages[0]!;
+    const since = Date.parse("2026-10-01T10:59:00Z");
+    const unloaded: FrontMessageLike = {
+      id: "m3",
+      status: "outbound",
+      date: new Date("2026-10-01T11:00:00Z"),
+    };
+    // Nothing outbound after the draft: the draft was simply closed.
+    expect(unloadedOutbound([first], since)).toBe(false);
+    // An outbound message after the draft with no body: the send happened, its text is not readable.
+    expect(unloadedOutbound([first, unloaded], since)).toBe(true);
+    // An earlier one does not make the plugin wait for it.
+    expect(unloadedOutbound([first, unloaded], Date.parse("2026-10-01T11:30:00Z"))).toBe(false);
+    // A loaded one is the send, not something to wait for.
+    expect(unloadedOutbound([first, sentMessage], since)).toBe(false);
+  });
+
   it("strips html and entities", () => {
     expect(stripHtml("<p>a&nbsp;b</p><p>c<br>d</p>")).toBe("a b\nc\nd");
   });
@@ -228,23 +260,37 @@ describe("decideOnSend", () => {
     settings: { ...DEFAULT_SETTINGS, requireReason: false },
   };
 
-  it("skips without a draft, an empty send, and a reply another teammate sent", () => {
+  it("skips without a draft and on an empty send", () => {
     const sent = { text: "<p>x</p>", fields: {} };
     expect(decideOnSend({ ...base, draft: null, send: sent })).toEqual({ action: "skip", why: "no-draft" });
     expect(decideOnSend({ ...base, send: { text: "<p></p>", fields: {} } })).toEqual({
       action: "skip",
       why: "empty",
     });
-    expect(decideOnSend({ ...base, send: { ...sent, authorHandle: "sam@carrier.com" } })).toEqual({
-      action: "skip",
-      why: "someone-else",
+  });
+
+  it("never treats the address a reply went out from as proof of who sent it", () => {
+    // A shared inbox sends as support@: refusing the capture because the acting teammate's own
+    // address differs would silently drop most captures in the workspaces this is for.
+    const d = decideOnSend({
+      ...base,
+      actor: "alice@company.com",
+      send: { text: draftText, fields: {}, sentAddress: "support@company.com", messageId: "msg_9" },
+    });
+    expect(d.action).toBe("capture");
+    if (d.action !== "capture") return;
+    // What Front told us is recorded as provenance, and the mismatch is visible rather than hidden.
+    expect(d.body.metadata).toMatchObject({
+      sentFrom: "support@company.com",
+      actorMatchesSentFrom: false,
+      sentMessageId: "msg_9",
     });
   });
 
   it("sending the draft unchanged is an approve capture", () => {
     const d = decideOnSend({
       ...base,
-      send: { text: draftText, fields: {}, authorHandle: "ray@carrier.com" },
+      send: { text: draftText, fields: {}, sentAddress: "ray@carrier.com" },
     });
     expect(d.action).toBe("capture");
     if (d.action !== "capture") return;
@@ -254,10 +300,50 @@ describe("decideOnSend", () => {
     expect(d.body.agent).toBe("support-reply");
     expect(d.body.draft.text).toBe(d.body.sent.text);
     expect(d.body.reasonCode).toBeNull();
-    expect(d.body.tags).toEqual(["draft:inserted", "public-reply"]);
+    expect(d.body.tags).toEqual(["draft:unknown", "public-reply"]);
     expect(d.body.url).toBe("https://app.frontapp.com/open/cnv_48213");
-    expect(d.body.metadata).toEqual({ recipient: "dana@example.com" });
+    expect(d.body.metadata).toMatchObject({
+      recipient: "dana@example.com",
+      draftOrigin: "inserted",
+      actorMatchesSentFrom: true,
+    });
     expect(d.body.context).toHaveLength(2);
+  });
+
+  it("says what the tag will be, and why", () => {
+    // A mechanism is not an author: both of these are the plugin seeing text move.
+    expect(draftTag("inserted")).toBe("draft:unknown");
+    expect(draftTag("preloaded")).toBe("draft:unknown");
+    expect(draftTag("assist")).toBe("draft:ai");
+    expect(draftTag("manual")).toBe("draft:manual");
+    expect(draftTagBasis("inserted")).toContain("draft:unknown");
+    expect(draftTagBasis("assist")).toContain("an assist");
+    expect(draftTagBasis("manual")).toContain("you wrote it");
+  });
+
+  it("tags only what it was told: a mechanism is not an author", () => {
+    const tagFor = (origin: "inserted" | "preloaded" | "assist" | "manual"): unknown => {
+      const d = decideOnSend({ ...base, draft: { ...draft, origin }, send: { text: draftText, fields: {} } });
+      if (d.action !== "capture") throw new Error(d.action);
+      return d.body.tags;
+    };
+    // A jump in the composer, or text already there on load: a paste is not proof of a model.
+    expect(tagFor("inserted")).toEqual(["draft:unknown", "public-reply"]);
+    expect(tagFor("preloaded")).toEqual(["draft:unknown", "public-reply"]);
+    expect(tagFor("assist")).toEqual(["draft:ai", "public-reply"]);
+    expect(tagFor("manual")).toEqual(["draft:manual", "public-reply"]);
+  });
+
+  it("times the send from the message Front dated, not from when the plugin noticed", () => {
+    const d = decideOnSend({
+      ...base,
+      draft: { ...draft, at: Date.parse("2026-10-01T09:00:00.000Z") },
+      send: { text: draftText, fields: {}, at: "2026-10-01T09:04:15.000Z" },
+      now: Date.parse("2026-10-01T10:00:00.000Z"),
+    });
+    if (d.action !== "capture") throw new Error(d.action);
+    expect(d.body.secondsToSend).toBe(255);
+    expect(d.body.metadata).toMatchObject({ sentAt: "2026-10-01T09:04:15.000Z" });
   });
 
   it("a changed reply is an edit capture carrying the reason", () => {
@@ -348,7 +434,7 @@ describe("statusLine", () => {
   it("describes the state", () => {
     expect(statusLine(null, null)).toBe("Waiting for a draft");
     expect(statusLine({ text: "one two three", origin: "manual", at: 1 }, null)).toBe(
-      "Draft marked by you · 3 words",
+      "Draft marked by you as your own · 3 words",
     );
     expect(statusLine(null, { kind: "captured", changed: false, dedup: false, caseTitle: null })).toBe(
       "Sent as drafted · approved",

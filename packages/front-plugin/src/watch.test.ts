@@ -118,7 +118,6 @@ function harness(options: {
       minDraftChars: 80,
       scopeTag: null,
       reasonPack: "support",
-      apiKey: "ov_live_123",
       ...options.settings,
     },
     origin: "https://app.frontapp.com",
@@ -173,7 +172,21 @@ describe("a draft landing in the composer", () => {
     await h.watcher.onContext(front.context(DRAFT_ID));
     await h.watcher.markDraft();
     expect(h.watcher.state().draft?.origin).toBe("manual");
-    expect(h.watcher.state().status).toBe("Draft marked by you · 5 words");
+    expect(h.watcher.state().status).toBe("Draft marked by you as your own · 5 words");
+  });
+
+  it("takes the teammate's word when they say an assist wrote it", async () => {
+    const front = new FakeFront({ messages: [inbound], draft: draft(draftText) });
+    const h = harness({ front });
+    await h.watcher.onContext(front.context(DRAFT_ID));
+    // The detector only saw text move: on its own that is not evidence of a model.
+    expect(h.watcher.state().draft?.origin).toBe("preloaded");
+    await h.watcher.markDraft("assist");
+    expect(h.watcher.state().draft?.origin).toBe("assist");
+    h.front.messages = [...h.front.messages, sent(draftText)];
+    h.front.draft = null;
+    await h.watcher.poll();
+    expect(h.front.posted[0]?.tags).toEqual(["draft:ai", "public-reply"]);
   });
 });
 
@@ -195,7 +208,10 @@ describe("a send", () => {
     expect(body.draft.text).toContain("5 business days");
     expect(body.sent.text).toContain("5 business days");
     expect(body.context.map((m) => m.role)).toEqual(["customer", "agent"]);
-    expect(body.secondsToSend).toBe(70);
+    // The draft left at 10:59 and the message Front dated says it went at 11:00: 60 seconds, not
+    // the 70 the plugin's own clock would report.
+    expect(body.secondsToSend).toBe(60);
+    expect(body.metadata).toMatchObject({ sentAt: "2026-10-01T11:00:00.000Z" });
     expect(h.watcher.state().status).toBe("Sent as drafted · approved");
     expect(h.front.reads.messages).toBe(1);
     expect(h.front.reads.comments).toBe(0);
@@ -284,17 +300,77 @@ describe("a send", () => {
     expect(h.watcher.state().held).toBe(false);
   });
 
-  it("does not record a reply another teammate sent on the same thread", async () => {
+  it("holds the capture while Front has not loaded the sent message's body", async () => {
+    const h = watching();
+    await h.open();
+    // The teammate sent it: the message is in the thread, its body is not readable yet.
+    h.front.messages = [...h.front.messages, { ...sent(draftText), content: undefined }];
+    h.front.draft = null;
+    await h.watcher.poll();
+    expect(h.front.posted).toHaveLength(0);
+    // The draft stays, so the capture can still happen once the body is readable.
+    expect(h.watcher.state().draft).not.toBeNull();
+
+    h.front.messages = h.front.messages.map((m) =>
+      m.content ? m : { ...m, content: { body: draftText, type: "html" as const } },
+    );
+    await h.watcher.poll();
+    expect(h.front.posted).toHaveLength(1);
+    expect(h.front.posted[0]?.sent.text).toContain("5 business days");
+    expect(h.watcher.state().draft).toBeNull();
+  });
+
+  it("gives up on a send whose body never loads, rather than holding forever", async () => {
+    const h = watching();
+    await h.open();
+    h.front.messages = [...h.front.messages, { ...sent(draftText), content: undefined }];
+    h.front.draft = null;
+    await h.watcher.poll();
+    expect(h.watcher.state().draft).not.toBeNull();
+
+    h.at("2026-10-01T11:10:00Z");
+    await h.watcher.poll();
+    expect(h.watcher.state().draft).toBeNull();
+    expect(h.front.posted).toHaveLength(0);
+  });
+
+  it("starts the next draft with a clean reason", async () => {
+    const h = watching();
+    await h.open();
+    await h.watcher.pickReason("wrong_answer", "stale note");
+
+    // The draft is closed without sending, then the composer is empty, then a new draft lands.
+    h.front.draft = null;
+    await h.watcher.onContext(h.front.context(null));
+    expect(h.front.posted).toHaveLength(0);
+
+    h.front.draft = draft(draftText.replace("within 5 business days", "within 2 business days"));
+    await h.watcher.onContext(h.front.context(DRAFT_ID));
+    h.front.messages = [...h.front.messages, sent(draftText.replace("covered", "not covered"))];
+    h.front.draft = null;
+    await h.watcher.poll();
+    // `require_reason` is on and this reply changed: with the old reason gone it is held, not posted.
+    expect(h.front.posted).toHaveLength(0);
+    expect(h.watcher.state().held).toBe(true);
+  });
+
+  it("records a shared inbox's reply and says whose address it went out from", async () => {
     const h = watching();
     await h.open();
     h.front.messages = [
       ...h.front.messages,
-      { ...sent(draftText), from: { handle: "sam@carrier.com", name: "Sam" } },
+      { ...sent(draftText), from: { handle: "support@carrier.com", name: "Carrier Support" } },
     ];
     h.front.draft = null;
     await h.watcher.poll();
-    expect(h.front.posted).toHaveLength(0);
-    expect(h.watcher.state().status).toBe("Waiting for a draft");
+    // `Message.from` is the address the customer saw, not the teammate who clicked send: a shared
+    // inbox would otherwise lose every capture, so it is recorded as provenance instead.
+    expect(h.front.posted).toHaveLength(1);
+    expect(h.front.posted[0]?.actor).toBe("ray@carrier.com");
+    expect(h.front.posted[0]?.metadata).toMatchObject({
+      sentFrom: "support@carrier.com",
+      actorMatchesSentFrom: false,
+    });
   });
 
   it("never blocks or throws when the capture fails, and says what happened", async () => {

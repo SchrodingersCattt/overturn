@@ -83,6 +83,13 @@ body {
   color: var(--muted);
 }
 
+/* What the tag will say about who wrote the draft, and why. */
+.origin {
+  margin: 6px 0 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .debug {
   margin-top: 12px;
   padding-top: 8px;

@@ -27,16 +27,16 @@ Source: [`packages/zendesk-app`](https://github.com/overturn-ai/overturn/tree/ma
 
 The Overturn plugin sits in the conversation sidebar, next to the composer.
 
-1. Create a project API key in Overturn (Settings → API keys).
+1. Create a project API key in Overturn (Settings → API keys) and start the capture proxy that holds it: `OVERTURN_API_KEY=… node packages/front-plugin/app/proxy.mjs` (also in the zip as `dist/app/proxy.mjs`).
 2. Build it (`pnpm --filter @overturn-ai/front-plugin build` → `dist/overturn-front-plugin.zip`) and host the folder: Front frames the page from a URL.
-3. Front → **Developers** → an app with a **sidebar plugin** feature, plugin URL `https://<your-host>/index.html?overturn_api_key=…&agent=support-reply&reason_pack=support`, then enable it for the company.
+3. Front → **Developers** → an app with a **sidebar plugin** feature, plugin URL `https://<your-host>/index.html?overturn_base_url=https://<your-proxy>&agent=support-reply&reason_pack=support`, then enable it for the company.
 
-Front plugins have no settings object, so the settings ride in that query string: `agent`, `reason_pack`, `decision_fields` (conversation custom attributes by name, e.g. `coverage,reserve`), `require_reason`, `capture_comments`, `min_draft_chars`, `scope_tag`, `overturn_base_url`. Without `overturn_api_key` the capture is relayed through Front (`relayHttp`), so the key never sits in the plugin.
+Front plugins have no settings object, so the settings ride in that query string: `agent`, `reason_pack`, `decision_fields` (conversation custom attributes by name, e.g. `coverage,reserve`), `require_reason`, `capture_comments`, `min_draft_chars`, `scope_tag`, `overturn_base_url`. Credentials do not: the page is loaded by a browser, so a key in its URL would sit in history, `Referer` headers and logs. Front's relay (`relayHttp`) posts each capture to `overturn_base_url`, and the proxy attaches the project key server-side.
 
 What the teammate sees:
 
-- **Draft inserted · 112 words** once a draft lands in the reply box (Front AI, a snippet, a paste). The thread is read only after a draft appeared and then left the composer, so a conversation nobody drafted in is never read.
-- A **reason** picker (`reason_pack`) with an optional note, and on send an approve or an edit capture as in Zendesk. The sent body is the newest message the teammate sent in the conversation, so what the expert actually wrote is the record.
+- **Draft inserted · 112 words** once a draft lands in the reply box (an assist, a snippet, a paste). The thread is read only after a draft appeared and then left the composer, so a conversation nobody drafted in is never read. The plugin saw text move and nothing more, so the run is tagged `draft:unknown` unless the teammate says who wrote it (two links in the panel: `draft:ai` / `draft:manual`); a paste is not evidence of a model.
+- A **reason** picker (`reason_pack`) with an optional note, and on send an approve or an edit capture as in Zendesk. The sent body is the newest message sent after the draft appeared, so what the expert actually wrote is the record. Front loads message bodies lazily, so a just-sent reply whose body is not readable yet holds the capture (and the picked reason) and is retried, never dropped; `Message.from` is recorded as the address the reply went out from, not as proof of who sent it.
 - `require_reason` holds a changed reply's capture in the panel until a chip is clicked. Front's plugin SDK has no pre-send hook — `Front.contextUpdates` is the only stream it offers — so the plugin never blocks or delays Front's send, and never records a change nobody explained.
 
 Source: [`packages/front-plugin`](https://github.com/overturn-ai/overturn/tree/main/packages/front-plugin). Salesforce Service Cloud and Gmail follow the same shape.

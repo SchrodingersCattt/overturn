@@ -16,6 +16,7 @@ import {
   sentFrom,
   snapshotFrom,
   statusLine,
+  unloadedOutbound,
 } from "./capture";
 
 /**
@@ -41,8 +42,8 @@ export interface Watcher {
   onContext(context: SingleContextLike | null): Promise<void>;
   /** Called on a timer while a draft is open: sees the teammate's edits and the draft going away. */
   poll(): Promise<void>;
-  /** "Use the current text as the draft": the teammate says this text is the draft. */
-  markDraft(): Promise<void>;
+  /** "Use the current text as the draft": the teammate says this text is the draft, and who wrote it. */
+  markDraft(origin?: "manual" | "assist"): Promise<void>;
   /** The reason chips and the optional note. True when a held capture went out with them. */
   pickReason(code: string | null, note: string): Promise<boolean>;
   state(): WatcherState;
@@ -51,6 +52,13 @@ export interface Watcher {
 /** Front pushes a draft into the composer and takes it away only through context updates, so the
  *  plugin also reads the open draft on a timer. */
 export const POLL_INTERVAL_MS = 1500;
+
+/**
+ * How long a send whose body Front never loads keeps the capture waiting. Front loads message
+ * bodies lazily, so a just-sent reply can arrive in `listMessages()` without one; the capture is
+ * held and retried until this, then it says so instead of recording nothing.
+ */
+export const PENDING_SEND_TTL_MS = 5 * 60 * 1000;
 
 export interface WatcherOptions {
   /** `POST /v1/capture`, however this install authenticates it. */
@@ -86,6 +94,8 @@ export function createWatcher(opts: WatcherOptions): Watcher {
   let last: PanelResult | null = null;
   let reasonCode: string | null = null;
   let note = "";
+  /** When a send was seen in the thread but Front has not loaded its body yet. */
+  let pendingSince: number | null = null;
 
   const scoped = (): boolean =>
     context !== null &&
@@ -94,10 +104,23 @@ export function createWatcher(opts: WatcherOptions): Watcher {
       opts.settings,
     );
 
+  /** The reason belongs to one draft cycle: it goes when the cycle does. */
+  function clearReason(): void {
+    reasonCode = null;
+    note = "";
+  }
+
   function clearDraftState(): void {
     draftId = null;
     draftAt = null;
+    pendingSince = null;
     detector.set(null);
+  }
+
+  /** A draft cycle ended without a capture; the reason picked for it goes with it. */
+  function settle(): void {
+    clearDraftState();
+    clearReason();
   }
 
   /**
@@ -160,21 +183,31 @@ export function createWatcher(opts: WatcherOptions): Watcher {
     const conversation = ctx?.conversation ?? null;
     const actor = ctx?.teammate.email ?? null;
     const fields = draftFields;
-    clearDraftState();
-    if (!ctx || !conversation || !draft) return;
+    if (!ctx || !conversation || !draft) {
+      settle();
+      return;
+    }
     let messages: readonly FrontMessageLike[];
     let comments: readonly FrontCommentLike[] = [];
     try {
       messages = (await ctx.listMessages()).results;
       if (opts.settings.captureComments) comments = (await ctx.listComments()).results;
     } catch (error) {
+      // Keep the draft and try again on the next tick: a read that failed is not a send that did not happen.
       log("overturn: could not read the conversation", error);
-      forget();
+      pendingSince = pendingSince ?? now();
+      return;
+    }
+    if (unloadedOutbound(messages, since)) {
+      // The reply is in the thread but Front has not loaded its body: hold the draft (and the
+      // reason) and look again rather than recording an empty send or dropping the capture.
+      pendingSince = pendingSince ?? now();
       return;
     }
     const sent = sentFrom(entriesFrom(messages, comments), since);
     if (!sent) {
-      // The draft was closed without sending: nothing to record, and the thread is not read again.
+      // The draft was closed without sending: nothing to record, and the reason goes with it.
+      settle();
       forget();
       return;
     }
@@ -191,7 +224,8 @@ export function createWatcher(opts: WatcherOptions): Watcher {
       send: {
         text: sent.body,
         messageId: sent.id,
-        authorHandle: sent.authorHandle,
+        at: sent.at,
+        sentAddress: sent.authorHandle,
         fields: conversationFields(conversation, opts.settings),
       },
       reasonCode,
@@ -200,6 +234,8 @@ export function createWatcher(opts: WatcherOptions): Watcher {
       settings: opts.settings,
       now: now(),
     });
+    // Whatever the outcome, this draft cycle is over: the next draft starts with a clean reason.
+    settle();
     if (decision.action === "skip") {
       log(`overturn: nothing to record (${decision.why})`);
       forget();
@@ -219,18 +255,18 @@ export function createWatcher(opts: WatcherOptions): Watcher {
     const wasScoped = scoped();
     context = next;
     if (!next) {
-      clearDraftState();
+      settle();
       forget();
       return;
     }
     if (previousConversation !== null && previousConversation !== next.conversation.id) {
       // A different thread: whatever was in the composer belonged to the last one.
-      clearDraftState();
+      settle();
       forget();
     }
     if (!wasScoped) forget();
     if (!scoped()) {
-      clearDraftState();
+      settle();
       return;
     }
     const nextDraft = next.conversation.draftId ?? null;
@@ -240,10 +276,11 @@ export function createWatcher(opts: WatcherOptions): Watcher {
       return;
     }
     if (nextDraft) {
-      // A draft landed in the reply box.
+      // A draft landed in the reply box: a new cycle, so any reason picked for the last one goes.
       draftId = nextDraft;
       draftAt = now();
       draftFields = conversationFields(next.conversation, opts.settings);
+      if (held === null) clearReason();
       forget();
       await readDraft();
       return;
@@ -253,11 +290,23 @@ export function createWatcher(opts: WatcherOptions): Watcher {
   }
 
   async function poll(): Promise<void> {
-    if (!scoped() || !draftId) return;
-    if (!(await readDraft())) await record();
+    if (!scoped()) return;
+    if (pendingSince !== null && now() - pendingSince > PENDING_SEND_TTL_MS) {
+      // The send is in the thread but Front never handed us its body: say so once, then let it go.
+      log("overturn: the send never became readable, so it was not recorded");
+      settle();
+      return;
+    }
+    if (draftId) {
+      if (!(await readDraft())) await record();
+      return;
+    }
+    if (pendingSince === null) return;
+    await record();
   }
 
-  async function markDraft(): Promise<void> {
+  /** "Use the current text as the draft": the teammate says this text is the draft, and who wrote it. */
+  async function markDraft(origin: "manual" | "assist" = "manual"): Promise<void> {
     const ctx = context;
     if (!scoped() || !ctx || !draftId) return;
     let draft: FrontDraftLike | undefined;
@@ -269,7 +318,7 @@ export function createWatcher(opts: WatcherOptions): Watcher {
     }
     const text = draft ? draftText(draft) : "";
     if (!text.trim()) return;
-    detector.set({ text, origin: "manual", at: now() });
+    detector.set({ text, origin, at: now() });
     draftFields = conversationFields(ctx.conversation, opts.settings);
     forget();
   }
