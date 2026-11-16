@@ -295,24 +295,61 @@ function attributeRecord(raw: unknown): Record<string, unknown> {
   return raw as Record<string, unknown>;
 }
 
-/** What the teammate actually sent: the newest non-empty reply in the thread. */
-export interface SentReply {
+/**
+ * A reply in the thread, with the two facts that decide whether it can be called "what was sent":
+ * whether it landed after the draft appeared, and whether its author is the teammate acting here.
+ * The app cannot see the composer, so the ordering is the only thing that ties a reply to a draft.
+ */
+export interface ThreadReply {
+  id: string | null;
   text: string;
   type: "publicReply" | "note";
   at: string | null;
+  atMs: number;
+  author: string | null;
+  /** The reply landed after the draft appeared (a minute of slack for Intercom's second-resolution clock). */
+  afterDraft: boolean;
+  /** The reply's author is the teammate looking at the panel. */
+  byActor: boolean;
 }
 
-export function sentFrom(conversation: IntercomConversation): SentReply | null {
+/**
+ * How much later than the draft a reply has to be before we call it the send: Intercom stamps
+ * parts in whole seconds and the draft's time comes from our own clock, so the same second can
+ * read as "before". A minute covers that without letting an old reply pass as this draft's send.
+ */
+export const DRAFT_ORDER_SLACK_MS = 60_000;
+
+export function newestReply(
+  conversation: IntercomConversation,
+  opts: { sinceMs?: number | null; actor?: string | null } = {},
+): ThreadReply | null {
+  const since =
+    typeof opts.sinceMs === "number" && opts.sinceMs > 0 ? opts.sinceMs - DRAFT_ORDER_SLACK_MS : null;
+  const actor = opts.actor?.trim().toLowerCase() || null;
   for (const part of partsOf(conversation).reverse()) {
     const role = partRole(part);
     if (role !== "agent" && role !== "note") continue;
+    const iso = isoAt(part.created_at);
+    const atMs = iso ? Date.parse(iso) : 0;
+    const author = authorOf(part.author);
     return {
+      id: part.id ?? null,
       text: stripHtml(part.body ?? ""),
       type: role === "note" ? "note" : "publicReply",
-      at: isoAt(part.created_at),
+      at: iso,
+      atMs,
+      author,
+      afterDraft: since === null ? true : atMs >= since,
+      byActor: actor !== null && author?.trim().toLowerCase() === actor,
     };
   }
   return null;
+}
+
+/** The newest reply in the thread, whoever sent it: context, not a claim about the send. */
+export function sentFrom(conversation: IntercomConversation): ThreadReply | null {
+  return newestReply(conversation);
 }
 
 /** A link back to the conversation, only when Intercom told us the workspace. */
@@ -393,19 +430,78 @@ export function draftFromTeammate(
 
 /** A draft an assist recorded with the Overturn SDK; the run is the source of truth. */
 export function draftFromRun(
-  run: { id: string; output: string; model?: string | null },
+  run: {
+    id: string;
+    output: string;
+    model?: string | null;
+    startedAt?: string | null;
+    createdAt?: string | null;
+  },
   now = Date.now(),
   fields: Record<string, unknown> = {},
 ): DraftState {
+  // The draft appeared when the drafting agent ran, not when this panel was opened: that is what
+  // the send is timed against, and what says whether a reply in the thread came after it.
+  const startedMs = Date.parse(run.startedAt ?? run.createdAt ?? "");
   return {
     text: normalizeCaptureText(run.output),
     origin: "ai",
     evidence: "recorded",
-    at: now,
+    at: Number.isFinite(startedMs) ? startedMs : now,
     runId: run.id,
     model: run.model ?? null,
     fields,
   };
+}
+
+/** A run as the Overturn API lists it, narrowed to what says "an assist wrote this draft". */
+export interface RecordedRun {
+  id?: string;
+  output?: unknown;
+  model?: unknown;
+  startedAt?: unknown;
+  createdAt?: unknown;
+  metadata?: unknown;
+  tags?: unknown;
+}
+
+/**
+ * Whether this run was synthesized by a capture rather than recorded by a drafting agent.
+ * `CaptureService.synthesize()` stamps every capture run with `metadata.capture` and a
+ * `capture:<source>` tag; without this check, reopening a conversation whose draft was already
+ * captured by hand would read that run back as a fresh AI draft and re-tag it `draft:ai`.
+ */
+export function isCaptureRun(run: RecordedRun): boolean {
+  const metadata = run.metadata;
+  if (metadata && typeof metadata === "object" && !Array.isArray(metadata) && "capture" in metadata) {
+    return true;
+  }
+  return Array.isArray(run.tags) && run.tags.some((t) => typeof t === "string" && t.startsWith("capture:"));
+}
+
+/** The newest run that a drafting agent really recorded, or null when there is only our own. */
+export function pickRecordedDraft(items: unknown): {
+  id: string;
+  output: string;
+  model: string | null;
+  startedAt: string | null;
+  createdAt: string | null;
+} | null {
+  if (!Array.isArray(items)) return null;
+  for (const item of items as RecordedRun[]) {
+    if (!item || typeof item !== "object") continue;
+    if (isCaptureRun(item)) continue;
+    const output = typeof item.output === "string" ? item.output : "";
+    if (typeof item.id !== "string" || !item.id || !output.trim()) continue;
+    return {
+      id: item.id,
+      output,
+      model: typeof item.model === "string" ? item.model : null,
+      startedAt: typeof item.startedAt === "string" ? item.startedAt : null,
+      createdAt: typeof item.createdAt === "string" ? item.createdAt : null,
+    };
+  }
+  return null;
 }
 
 /** Anything reply-sized is worth naming; a typed greeting is not a draft. */
@@ -459,6 +555,17 @@ export interface PendingSend {
   type: "publicReply" | "note";
   /** When the reply landed in the thread, when Intercom said. */
   at?: string | null;
+  /** Where the text came from: the thread's own part, or what the teammate typed in the panel. */
+  basis: "thread" | "typed";
+  /** The part this send came from, when it came from the thread. */
+  partId?: string | null;
+  /** Who sent it, when the thread said. */
+  author?: string | null;
+  /**
+   * True when the text is the teammate's word rather than a reply Intercom shows: the record is
+   * still worth keeping, but it is marked as manually confirmed and never as a verified send.
+   */
+  unverified?: boolean;
 }
 
 export type CaptureDecision =
@@ -519,7 +626,8 @@ export function decideOnCapture(input: {
     sent: sentAnswer,
     reason: reason || null,
     reasonCode: diff.changed ? reasonCode : null,
-    secondsToSend: Math.max(0, Math.round(((input.now ?? Date.now()) - draft.at) / 100) / 10),
+    // The clock runs from the draft to what was actually sent, not to the moment of recording.
+    secondsToSend: secondsBetween(draft.at, sent.at, input.now ?? Date.now()),
     draftRunId: draft.runId ?? null,
     draftModel: draft.model ?? null,
     url: conversationUrl(conversation, input.workspaceId),
@@ -528,10 +636,22 @@ export function decideOnCapture(input: {
       workspace: input.workspaceId ?? null,
       requester: requesterOf(conversation),
       draftEvidence: draft.evidence,
+      /** How the sent half was established: a reply Intercom shows, or the teammate's word. */
+      sentBasis: sent.basis,
+      sentPartId: sent.partId ?? null,
+      sentAuthor: sent.author ?? null,
       sentAt: sent.at ?? null,
+      ...(sent.unverified ? { sentUnverified: true } : {}),
     },
   };
   return { action: "capture", body, changed: diff.changed, changedFields: diff.changedFields };
+}
+
+/** Whole tenths of a second from the draft to the send, never negative and never guessed by recency. */
+function secondsBetween(fromMs: number, sentAt: string | null | undefined, now: number): number {
+  const sentMs = sentAt ? Date.parse(sentAt) : Number.NaN;
+  const end = Number.isFinite(sentMs) ? sentMs : now;
+  return Math.max(0, Math.round((end - fromMs) / 100) / 10);
 }
 
 function subjectFrom(conversation: IntercomConversation): string | null {

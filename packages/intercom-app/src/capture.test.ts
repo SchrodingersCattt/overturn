@@ -11,8 +11,12 @@ import {
   fieldsFrom,
   type IntercomConversation,
   inScope,
+  isCaptureRun,
   isDraftSized,
+  newestReply,
   originLine,
+  type PendingSend,
+  pickRecordedDraft,
   quickReasons,
   sentFrom,
   settingsFrom,
@@ -36,7 +40,7 @@ const conversation: IntercomConversation = {
       {
         id: "p1",
         part_type: "comment",
-        body: "<p>Thanks for flagging it — I am checking now.</p>",
+        body: "<p>Thanks for flagging it �?I am checking now.</p>",
         author: { type: "admin", email: "ray@carrier.com" },
         created_at: 1_761_900_000,
       },
@@ -74,6 +78,13 @@ const settings = (over: Partial<AppSettings> = {}): AppSettings => ({
 });
 
 const aiDraft = draftFromTeammate(draftText, "ai", "assist", 1_761_900_000_000);
+
+/** A send that came from the thread, so a test that is not about provenance does not have to say so. */
+const send = (
+  text: string,
+  type: PendingSend["type"] = "publicReply",
+  at: string | null = null,
+): PendingSend => ({ text, type, at, basis: "thread", partId: "p3", author: "ray@carrier.com" });
 
 describe("settings", () => {
   it("parses the install config", () => {
@@ -151,7 +162,7 @@ describe("the thread", () => {
       {
         role: "agent",
         author: "ray@carrier.com",
-        content: "Thanks for flagging it — I am checking now.",
+        content: "Thanks for flagging it �?I am checking now.",
         at: "2025-10-31T08:40:00.000Z",
       },
       {
@@ -198,12 +209,20 @@ describe("the thread", () => {
     expect(contextFrom(odd).map((m) => m.role)).toEqual(["system", "system"]);
   });
 
-  it("what the teammate sent is the newest reply in the thread", () => {
+  it("what the thread shows is read with its part, its author and whether it landed after the draft", () => {
     expect(sentFrom(conversation)).toEqual({
+      id: "p3",
       text: "The duplicate is refunded and lands within 5 business days.",
       type: "publicReply",
       at: "2025-10-31T08:42:00.000Z",
+      atMs: Date.parse("2025-10-31T08:42:00.000Z"),
+      author: "ray@carrier.com",
+      afterDraft: true,
+      byActor: false,
     });
+    expect(newestReply(conversation, { actor: "ray@carrier.com" })?.byActor).toBe(true);
+    expect(newestReply(conversation, { sinceMs: 1_761_900_200_000 })?.afterDraft).toBe(false);
+    expect(newestReply(conversation, { sinceMs: 1_761_900_000_000 })?.afterDraft).toBe(true);
     const noteLast: IntercomConversation = {
       ...conversation,
       conversation_parts: {
@@ -247,24 +266,50 @@ describe("the thread", () => {
 });
 
 describe("draft origin", () => {
-  it("tags only what it was told: ai, manual, or unknown — never a guess", () => {
+  it("tags only what it was told: ai, manual, or unknown �?never a guess", () => {
     expect(draftTag(draftFromTeammate(draftText, "ai", "assist").origin)).toBe("draft:ai");
     expect(draftTag(draftFromTeammate(draftText, "manual", "typed").origin)).toBe("draft:manual");
     expect(draftTag(draftFromTeammate(draftText, "unknown", "not-stated").origin)).toBe("draft:unknown");
   });
 
-  it("an assist that recorded its run with the SDK is ai, with the run attached", () => {
+  it("an assist that recorded its run with the SDK is ai, timed from the run itself", () => {
     const d = draftFromRun(
-      { id: "0199a0d0-0000-7000-8000-000000000000", output: draftText, model: "gpt-4.1-mini" },
+      {
+        id: "0199a0d0-0000-7000-8000-000000000000",
+        output: draftText,
+        model: "gpt-4.1-mini",
+        startedAt: "2025-10-31T08:40:00.000Z",
+      },
       5,
     );
     expect(d).toMatchObject({
       origin: "ai",
       evidence: "recorded",
-      at: 5,
+      at: Date.parse("2025-10-31T08:40:00.000Z"),
       runId: "0199a0d0-0000-7000-8000-000000000000",
       model: "gpt-4.1-mini",
     });
+    // No timestamp on the run: the moment we read it is all we have.
+    expect(draftFromRun({ id: "r", output: draftText }, 5).at).toBe(5);
+  });
+
+  it("a run a capture synthesized is never read back as a drafting agent's draft", () => {
+    expect(isCaptureRun({ id: "r", metadata: { capture: "intercom" } })).toBe(true);
+    expect(isCaptureRun({ id: "r", tags: ["capture:zendesk", "draft:ai"] })).toBe(true);
+    expect(isCaptureRun({ id: "r", tags: ["draft:recorded"], metadata: { env: "prod" } })).toBe(false);
+    const items = [
+      {
+        id: "captured-run",
+        output: draftText,
+        metadata: { capture: "intercom" },
+        tags: ["capture:intercom"],
+      },
+      { id: "agent-run", output: draftText, model: "gpt-4.1-mini", startedAt: "2025-10-31T08:40:00.000Z" },
+    ];
+    expect(pickRecordedDraft(items)).toMatchObject({ id: "agent-run", model: "gpt-4.1-mini" });
+    expect(pickRecordedDraft([items[0]])).toBeNull();
+    expect(pickRecordedDraft([{ id: "x", output: "  " }])).toBeNull();
+    expect(pickRecordedDraft("nonsense")).toBeNull();
   });
 
   it("says out loud why the tag is what it is", () => {
@@ -298,22 +343,21 @@ describe("decideOnCapture", () => {
   const base = {
     conversation,
     draft: aiDraft,
-    sent: { text: draftText, type: "publicReply" as const, at: "2025-10-31T11:22:00.000Z" },
+    sent: send(draftText, "publicReply", "2025-10-31T11:22:00.000Z"),
     reasonCode: null as string | null,
     reason: "",
     actor: "ray@carrier.com",
     workspaceId: "abcd123",
     settings: settings({ requireReason: false }),
   };
-
   it("skips without a draft, without a reply, on notes, and out of scope", () => {
     expect(decideOnCapture({ ...base, draft: null })).toEqual({ action: "skip", why: "no-draft" });
     expect(decideOnCapture({ ...base, sent: null })).toEqual({ action: "skip", why: "empty" });
-    expect(decideOnCapture({ ...base, sent: { text: "<p></p>", type: "publicReply" } })).toEqual({
+    expect(decideOnCapture({ ...base, sent: send("<p></p>") })).toEqual({
       action: "skip",
       why: "empty",
     });
-    expect(decideOnCapture({ ...base, sent: { text: sentText, type: "note" } })).toEqual({
+    expect(decideOnCapture({ ...base, sent: send(sentText, "note") })).toEqual({
       action: "skip",
       why: "note",
     });
@@ -324,7 +368,7 @@ describe("decideOnCapture", () => {
     expect(
       decideOnCapture({
         ...base,
-        sent: { text: sentText, type: "note" },
+        sent: send(sentText, "note"),
         settings: settings({ captureNotes: true, requireReason: false }),
       }).action,
     ).toBe("capture");
@@ -350,8 +394,40 @@ describe("decideOnCapture", () => {
       workspace: "abcd123",
       requester: "dana@example.com",
       draftEvidence: "assist",
+      sentBasis: "thread",
+      sentPartId: "p3",
+      sentAuthor: "ray@carrier.com",
       sentAt: "2025-10-31T11:22:00.000Z",
     });
+  });
+
+  it("marks a send the teammate typed rather than leaving it looking verified", () => {
+    const d = decideOnCapture({
+      ...base,
+      sent: { text: sentText, type: "publicReply", basis: "typed", unverified: true },
+      now: aiDraft.at,
+    });
+    if (d.action !== "capture") throw new Error(d.action);
+    expect(d.body.metadata).toMatchObject({ sentBasis: "typed", sentUnverified: true, sentPartId: null });
+    // Nothing in the thread dates the send, so the recording moment is the only clock there is.
+    expect(d.body.secondsToSend).toBe(0);
+  });
+
+  it("times the send from the reply's own stamp, not from the recording", () => {
+    const d = decideOnCapture({
+      ...base,
+      draft: { ...aiDraft, at: 10_000 },
+      sent: {
+        text: sentText,
+        type: "publicReply",
+        at: new Date(14_250).toISOString(),
+        basis: "thread",
+        partId: "p9",
+      },
+      now: 900_000,
+    });
+    if (d.action !== "capture") throw new Error(d.action);
+    expect(d.body.secondsToSend).toBe(4.3);
   });
 
   it("a changed reply is an edit capture carrying the reason", () => {
@@ -359,7 +435,7 @@ describe("decideOnCapture", () => {
       ...base,
       reasonCode: "wrong_amount_or_date",
       reason: "Refunds settle in 2 days here",
-      sent: { text: sentText, type: "publicReply" },
+      sent: send(sentText),
     });
     expect(d.action).toBe("capture");
     if (d.action !== "capture") return;
@@ -376,7 +452,7 @@ describe("decideOnCapture", () => {
 
   it("require_reason (the default) holds a changed capture until a code is picked; a note alone is not enough", () => {
     const strict = settings({ requireReason: true });
-    const changed = { text: sentText, type: "publicReply" as const };
+    const changed = send(sentText);
     expect(decideOnCapture({ ...base, settings: strict, sent: changed })).toEqual({
       action: "need-reason",
       changedFields: [],
@@ -415,10 +491,11 @@ describe("decideOnCapture", () => {
     expect(d.body.sent.fields).toEqual({ status: "escalated" });
   });
 
-  it("records how long the draft sat in front of the teammate", () => {
+  it("records how long the draft sat in front of the teammate when nothing was sent yet", () => {
     const d = decideOnCapture({
       ...base,
       draft: { ...aiDraft, at: 10_000 },
+      sent: { text: sentText, type: "publicReply", basis: "typed", unverified: true },
       now: 14_250,
     });
     if (d.action !== "capture") throw new Error(d.action);
@@ -456,7 +533,7 @@ describe("decideOnCapture", () => {
     const d = decideOnCapture({
       ...base,
       settings: settings({ captureNotes: true, requireReason: false }),
-      sent: { text: sentText, type: "note" },
+      sent: send(sentText, "note"),
     });
     if (d.action !== "capture") throw new Error(d.action);
     expect(d.body.tags).toEqual(["draft:ai", "internal-note"]);
@@ -466,7 +543,7 @@ describe("decideOnCapture", () => {
     const d = decideOnCapture({
       ...base,
       draft: draftFromTeammate(`  <p>${draftText}</p>  `, "manual", "typed"),
-      sent: { text: `<p>${sentText}</p>`, type: "publicReply" },
+      sent: send(`<p>${sentText}</p>`),
     });
     if (d.action !== "capture") throw new Error(d.action);
     expect(d.body.draft.text).toBe(draftText);

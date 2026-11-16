@@ -2,7 +2,12 @@ import type { CaptureResult } from "@overturn-ai/shared";
 import { describe, expect, it } from "vitest";
 import type { CanvasComponent, CanvasPayload } from "./canvas";
 import { COMPONENT } from "./canvas";
-import { type CanvasRequest, type IntercomConversation, STORED_DRAFT_KEY } from "./capture";
+import {
+  type CanvasRequest,
+  draftFromTeammate,
+  type IntercomConversation,
+  STORED_DRAFT_KEY,
+} from "./capture";
 import { handleCanvasRequest, pendingSend, runtimeFrom } from "./main";
 
 const draftText =
@@ -24,7 +29,7 @@ function conversation(over: Partial<IntercomConversation> = {}): IntercomConvers
           part_type: "comment",
           body: "<p>The duplicate is refunded and lands within 5 business days.</p>",
           author: { type: "admin", email: "ray@carrier.com", is_ai_answer: true },
-          created_at: 1_761_900_120,
+          created_at: 1_761_899_400,
         },
       ],
     },
@@ -35,7 +40,14 @@ function conversation(over: Partial<IntercomConversation> = {}): IntercomConvers
 }
 
 const recorded = {
-  items: [{ id: "0199a0d0-0000-7000-8000-000000000000", output: draftText, model: "gpt-4.1-mini" }],
+  items: [
+    {
+      id: "0199a0d0-0000-7000-8000-000000000000",
+      output: draftText,
+      model: "gpt-4.1-mini",
+      startedAt: "2025-10-31T08:42:30.000Z",
+    },
+  ],
 };
 
 const captured: CaptureResult = {
@@ -106,6 +118,9 @@ const component = (payload: CanvasPayload, id: string): CanvasComponent | undefi
 const storedDraftJson = (payload: CanvasPayload): Record<string, unknown> =>
   JSON.parse(String(payload.canvas.stored_data?.[STORED_DRAFT_KEY] ?? "{}")) as Record<string, unknown>;
 
+/** The draft the canvas is holding, as the payload (not the string) it will be read back as. */
+const readyCanvasState = (payload: CanvasPayload): Record<string, unknown> => storedDraftJson(payload);
+
 describe("initialize", () => {
   it("asks for the draft when nothing recorded one", async () => {
     const h = harness([]);
@@ -114,8 +129,64 @@ describe("initialize", () => {
       h.runtime,
     );
     expect(texts(canvas)[0]).toBe("Waiting for the draft");
-    expect(h.calls[0]?.url).toContain("/v1/runs?externalId=ic%3A21547896&agent=support-reply&limit=1");
+    expect(h.calls[0]?.url).toContain("/v1/runs?externalId=ic%3A21547896&agent=support-reply&limit=10");
     expect(component(canvas, COMPONENT.nameDraft)).toBeDefined();
+  });
+
+  it("never reads the conversation back from Intercom when no draft is known", async () => {
+    const h = harness([{ match: "/conversations/21547896", body: conversation() }], {
+      intercom_token: "dG9r",
+    });
+    const canvas = await handleCanvasRequest(
+      { workspace_id: "abcd123", conversation: { id: "21547896" } },
+      h.runtime,
+    );
+    // Only the runs lookup (our own API) happened: issue #21 keeps undrafted conversations unread.
+    expect(h.calls.map((c) => c.url)).toEqual([
+      "https://api.overturn.run/v1/runs?externalId=ic%3A21547896&agent=support-reply&limit=10",
+    ]);
+    expect(texts(canvas)[0]).toBe("Waiting for the draft");
+  });
+
+  it("reads a partial conversation back from the Intercom API once a draft is known", async () => {
+    const h = harness([{ match: "/conversations/21547896", body: conversation() }], {
+      intercom_token: "dG9r",
+    });
+    const canvas = await handleCanvasRequest(
+      { workspace_id: "abcd123", conversation: { id: "21547896" } },
+      h.runtime,
+    );
+    expect(texts(canvas)[0]).toBe("Waiting for the draft");
+
+    // Naming the draft is when the thread is fetched, and the panel then shows what Intercom says.
+    const naming = await handleCanvasRequest(
+      submit(canvas, COMPONENT.nameDraft, {}, { id: "21547896" }),
+      h.runtime,
+    );
+    const ready2 = await handleCanvasRequest(
+      submit(naming, COMPONENT.originManual, { [COMPONENT.draftText]: draftText }, { id: "21547896" }),
+      h.runtime,
+    );
+    const call = h.calls.find((c) => c.url.includes("/conversations/"));
+    expect(call?.url).toBe("https://api.intercom.io/conversations/21547896?display_as=plaintext");
+    expect(call?.init?.headers).toMatchObject({ authorization: "Bearer dG9r" });
+    expect(h.calls.filter((c) => c.url.includes("/conversations/"))).toHaveLength(1);
+    // Only a thread read from Intercom can say when its last reply went out.
+    expect(texts(ready2).some((t) => t.includes("went out before this draft"))).toBe(true);
+  });
+
+  it("keeps a reply that went out before the draft out of the sent half", async () => {
+    const h = harness([{ match: "/v1/runs", body: recorded }]);
+    const canvas = await handleCanvasRequest(
+      { workspace_id: "abcd123", conversation: conversation() },
+      h.runtime,
+    );
+    const base = readyCanvasState(canvas);
+    expect(base).toMatchObject({ origin: "ai" });
+    const done = await handleCanvasRequest(submit(canvas, COMPONENT.save, {}, conversation()), h.runtime);
+    // Nothing in the thread dates a send, and nothing was typed: nothing is recorded, and it says so.
+    expect(h.captureCall()).toBeUndefined();
+    expect(texts(done).some((t) => t.includes("No reply after this draft"))).toBe(true);
   });
 
   it("shows Draft inserted · N words when the drafting agent recorded its run", async () => {
@@ -130,26 +201,12 @@ describe("initialize", () => {
       evidence: "recorded",
       runId: "0199a0d0-0000-7000-8000-000000000000",
       model: "gpt-4.1-mini",
+      at: Date.parse("2025-10-31T08:42:30.000Z"),
     });
     expect(texts(canvas).some((t) => t.includes("recorded with the Overturn SDK"))).toBe(true);
-    // The reply Intercom already has is offered as what went out.
-    expect(component(canvas, COMPONENT.sent)).toMatchObject({
-      value: "The duplicate is refunded and lands within 5 business days.",
-    });
-  });
-
-  it("reads a partial conversation back from the Intercom API when a token is configured", async () => {
-    const h = harness([{ match: "/conversations/21547896", body: conversation() }], {
-      intercom_token: "dG9r",
-    });
-    const canvas = await handleCanvasRequest(
-      { workspace_id: "abcd123", conversation: { id: "21547896" } },
-      h.runtime,
-    );
-    expect(h.calls[0]?.url).toBe("https://api.intercom.io/conversations/21547896?display_as=plaintext");
-    expect(h.calls[0]?.init?.headers).toMatchObject({ authorization: "Bearer dG9r" });
-    expect(storedDraftJson(canvas)).toEqual({});
-    expect(texts(canvas).some((t) => t.includes("is_ai_answer"))).toBe(true);
+    // The thread's only reply went out an hour before the run started: it is not the send.
+    expect(component(canvas, COMPONENT.sent)?.value).toBeUndefined();
+    expect(texts(canvas).some((t) => t.includes("went out before this draft"))).toBe(true);
   });
 
   it("does nothing at all for a conversation the install does not watch", async () => {
@@ -250,11 +307,65 @@ describe("recording the fix", () => {
       workspace: "abcd123",
       requester: "dana@example.com",
       draftEvidence: "recorded",
+      // The text came from the teammate, not from a reply Intercom shows: said so in the record.
+      sentBasis: "typed",
+      sentUnverified: true,
     });
     expect((body.context as unknown[]).length).toBe(2);
     expect(texts(done)[0]).toBe("Sent as drafted · approved");
+    expect(texts(done).some((t) => t.includes("confirmed by you"))).toBe(true);
     expect(done.event).toEqual({ type: "completed" });
     expect(h.calls.filter((c) => c.url.endsWith("/v1/capture"))).toHaveLength(1);
+  });
+
+  it("calls the sent half verified when it is a reply the thread itself shows", async () => {
+    const h = harness([
+      { match: "/v1/runs", body: recorded },
+      { match: "/v1/capture", body: { ...captured, kind: "approve", changed: false, case: null } },
+    ]);
+    // A reply that landed after the run started: the thread is the source of truth for the send.
+    const after: IntercomConversation = conversation({
+      conversation_parts: {
+        conversation_parts: [
+          {
+            id: "p1",
+            part_type: "comment",
+            body: "<p>The duplicate is refunded and lands within 5 business days.</p>",
+            author: { type: "admin", email: "ray@carrier.com" },
+            created_at: 1_761_900_240,
+          },
+        ],
+      },
+    });
+    const ready = await handleCanvasRequest({ workspace_id: "abcd123", conversation: after }, h.runtime);
+    expect(component(ready, COMPONENT.sent)).toMatchObject({
+      value: "The duplicate is refunded and lands within 5 business days.",
+    });
+    const picked = await handleCanvasRequest(
+      submit(
+        ready,
+        `${COMPONENT.reasonPrefix}wrong_answer`,
+        { [COMPONENT.sent]: "The duplicate is refunded and lands within 5 business days." },
+        after,
+      ),
+      h.runtime,
+    );
+    const done = await handleCanvasRequest(
+      submit(
+        picked,
+        COMPONENT.save,
+        { [COMPONENT.sent]: "The duplicate is refunded and lands within 5 business days." },
+        after,
+      ),
+      h.runtime,
+    );
+    expect(texts(done)[0]).toBe("Sent as drafted · approved");
+    expect(component(done, COMPONENT.startOver)).toBeDefined();
+    expect(h.captureBody().metadata).toMatchObject({
+      sentBasis: "thread",
+      sentPartId: "p1",
+      sentAuthor: "ray@carrier.com",
+    });
   });
 
   it("carries the reason code for a changed reply, and the case it became", async () => {
@@ -377,20 +488,44 @@ describe("recording the fix", () => {
 });
 
 describe("pendingSend", () => {
-  it("prefers what the teammate corrected, else the thread", () => {
-    expect(pendingSend(conversation(), "  typed  ")).toMatchObject({ text: "typed", type: "publicReply" });
-    expect(pendingSend(conversation(), "")?.text).toContain("5 business days");
-    expect(pendingSend({ id: "1" }, "")).toBeNull();
-    // A note is handed on as a note: the decision is what refuses it when notes are off.
+  // A draft that appeared before the thread's only reply, and one that appeared after it.
+  const beforeReply = draftFromTeammate(draftText, "ai", "assist", Date.parse("2025-10-31T07:50:00.000Z"));
+  const afterReply = draftFromTeammate(draftText, "ai", "assist", Date.parse("2025-10-31T08:42:30.000Z"));
+
+  it("takes a reply only when it landed after the draft, and text the teammate typed as their word", () => {
+    // Typed text is never presented as a verified send.
+    expect(pendingSend(conversation(), beforeReply, "  typed  ", null)).toMatchObject({
+      text: "typed",
+      basis: "typed",
+      unverified: true,
+    });
+    // The thread's own reply, after the draft, with the part it came from.
+    expect(pendingSend(conversation(), beforeReply, "", "ray@carrier.com")).toMatchObject({
+      basis: "thread",
+      partId: "p1",
+      author: "ray@carrier.com",
+      type: "publicReply",
+    });
+    // A reply that predates the draft is not the send.
+    expect(pendingSend(conversation(), afterReply, "", null)).toBeNull();
+    expect(pendingSend({ id: "1" }, beforeReply, "", null)).toBeNull();
+    // Text that matches the thread's own reply is still the thread's reply, not a typed claim.
     expect(
       pendingSend(
-        conversation({
-          conversation_parts: {
-            conversation_parts: [{ id: "n", part_type: "note", body: "note", created_at: 2 }],
-          },
-        }),
-        "",
+        conversation(),
+        beforeReply,
+        "The duplicate is refunded and lands within 5 business days.",
+        "ray@carrier.com",
       ),
-    ).toMatchObject({ type: "note" });
+    ).toMatchObject({ basis: "thread", partId: "p1" });
+  });
+
+  it("hands a note on as a note, for the decision to refuse when notes are off", () => {
+    const noted = conversation({
+      conversation_parts: {
+        conversation_parts: [{ id: "n", part_type: "note", body: "note", created_at: 1_761_900_300 }],
+      },
+    });
+    expect(pendingSend(noted, beforeReply, "", null)).toMatchObject({ type: "note", basis: "thread" });
   });
 });

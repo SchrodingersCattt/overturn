@@ -67,10 +67,25 @@ function signatureOk(rawBody, header, secret) {
   const want = Buffer.from(expected);
   return got.length === want.length && timingSafeEqual(got, want);
 }
-
 const port = Number(process.env.PORT ?? 8787);
 const secret = process.env.INTERCOM_CLIENT_SECRET;
+/** Local development only: without a secret, an unsigned request can record anything. */
+const allowUnsigned = process.env.OVERTURN_ALLOW_UNSIGNED === "1";
 const settings = config();
+
+/** A Canvas Kit request is a conversation snapshot; anything larger is not one. */
+const MAX_BODY_BYTES = Number(process.env.OVERTURN_MAX_BODY_BYTES ?? 1_048_576);
+
+// Fail closed: an unsigned public capture webhook is a way to forge a project's records, so the
+// process does not start without a secret unless the operator explicitly says this is local dev.
+if (!secret && !allowUnsigned) {
+  console.error(
+    "Refusing to start: INTERCOM_CLIENT_SECRET is not set, so Intercom's X-Body-Signature cannot be\n" +
+      "checked and anyone who learns this URL could forge captures. Set it (Developer Hub → Authentication)\n" +
+      "or, for local development only, set OVERTURN_ALLOW_UNSIGNED=1.",
+  );
+  process.exit(1);
+}
 
 const server = createServer((req, res) => {
   const send = (status, body) => {
@@ -84,12 +99,26 @@ const server = createServer((req, res) => {
   if (url.pathname !== "/intercom/initialize" && url.pathname !== "/intercom/submit") {
     return send(404, { error: "not found" });
   }
+  const declared = Number(req.headers["content-length"] ?? 0);
+  if (declared > MAX_BODY_BYTES) return send(413, { error: "body too large" });
 
   const chunks = [];
-  req.on("data", (chunk) => chunks.push(chunk));
+  let size = 0;
+  let aborted = false;
+  req.on("data", (chunk) => {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      aborted = true;
+      send(413, { error: "body too large" });
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
   req.on("end", async () => {
+    if (aborted) return;
     const raw = Buffer.concat(chunks).toString("utf8");
-    if (secret && !signatureOk(raw, req.headers["x-body-signature"], secret)) {
+    if (!signatureOk(raw, req.headers["x-body-signature"], secret)) {
       return send(401, { error: "bad signature" });
     }
     let payload;
@@ -124,5 +153,5 @@ server.listen(port, () => {
   console.log(`Initialize flow webhook URL: ${base}/intercom/initialize`);
   console.log(`Submit flow webhook URL:     ${base}/intercom/submit`);
   if (!settings.overturn_api_key) console.log("No OVERTURN_API_KEY: nothing will be recorded.");
-  if (!secret) console.log("No INTERCOM_CLIENT_SECRET: signatures are not checked.");
+  if (!secret) console.log("WARNING: OVERTURN_ALLOW_UNSIGNED=1 — signatures are NOT checked.");
 });

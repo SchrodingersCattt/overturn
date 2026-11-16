@@ -15,6 +15,7 @@ import {
   statusLine,
   storeDraft,
   storedDraft,
+  type ThreadReply,
 } from "./capture";
 
 /** Every component this app renders, so a click can be attributed to one place. */
@@ -195,6 +196,16 @@ export function aiHint(signals: AiSignals | null): string | null {
 }
 
 /**
+ * A reply that went out before this draft is not what this draft became, and saying so is the
+ * whole difference between a correction and a plausible-looking record.
+ */
+export function staleLine(reply: ThreadReply | null | undefined): string | null {
+  if (!reply) return null;
+  const when = reply.at ? ` (${reply.at.replace("T", " ").replace(/\..*$/, "")} UTC)` : "";
+  return `The last reply in this thread${when} went out before this draft, so it is not counted as what you sent: paste the reply this draft became, and it is recorded as confirmed by you.`;
+}
+
+/**
  * Nothing is claimed yet. Intercom never shows an app the reply composer, so the canvas says so
  * instead of inventing a draft; the first canvas stays small and avoids a primary button, as the
  * Inbox design rules ask.
@@ -247,8 +258,10 @@ export interface ReadyCanvasInput {
   note: string;
   /** What Intercom says about AI involvement in this thread, when it says anything. */
   signals?: AiSignals | null;
+  /** The thread's newest reply, when it went out before the draft: context, not the send. */
+  staleReply?: ThreadReply | null;
   /** Set once a capture happened, so the canvas reports instead of asking again. */
-  last?: { changed: boolean; dedup: boolean } | null;
+  last?: { changed: boolean; dedup: boolean; unverified?: boolean } | null;
   /** Why the last attempt did not record, in the teammate's words. */
   hint?: string | null;
   caseTitle?: string | null;
@@ -264,7 +277,12 @@ export function readyCanvas(input: ReadyCanvasInput): CanvasPayload {
   if (last) {
     if (input.caseTitle) components.push(text(`Case: ${input.caseTitle}`));
     components.push(
-      text("The run page in Overturn links back to this conversation.", { style: "muted" }),
+      text(
+        last.unverified
+          ? "The sent half is what you typed here: the thread does not show it, so it is recorded as confirmed by you."
+          : "The run page in Overturn links back to this conversation.",
+        { style: "muted" },
+      ),
       divider(),
       button(COMPONENT.startOver, "Record another", { style: "link" }),
     );
@@ -287,7 +305,7 @@ export function readyCanvas(input: ReadyCanvasInput): CanvasPayload {
       placeholder: "The reply as it went out",
     }),
   );
-  const hint = input.hint ?? aiHint(input.signals ?? null);
+  const hint = input.hint ?? staleLine(input.staleReply) ?? aiHint(input.signals ?? null);
   if (hint) components.push(text(hint, { style: input.hint ? "error" : "muted" }));
   components.push(
     divider(),

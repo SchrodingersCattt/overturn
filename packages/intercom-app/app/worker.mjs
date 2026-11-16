@@ -7,6 +7,9 @@ import { handleCanvasRequest, runtimeFrom } from "./assets/main.mjs";
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
+/** A Canvas Kit request is a conversation snapshot; anything larger is not one. */
+const MAX_BODY_BYTES = 1_048_576;
+
 const canvasSaying = (message) =>
   json({ canvas: { content: { components: [{ type: "text", text: message, style: "muted" }] } } });
 
@@ -62,15 +65,25 @@ export default {
       return json({ error: "not found" }, 404);
     }
 
-    const rawBody = await request.text();
-    if (env.INTERCOM_CLIENT_SECRET) {
-      const ok = await validSignature(
-        rawBody,
-        request.headers.get("x-body-signature"),
-        env.INTERCOM_CLIENT_SECRET,
+    // Fail closed. Without the secret nothing can tell Intercom from anyone else who has the URL,
+    // and a forged request records into the project; a misconfigured install serves no canvas.
+    const secret = env.INTERCOM_CLIENT_SECRET;
+    if (!secret) {
+      return json(
+        {
+          error:
+            "INTERCOM_CLIENT_SECRET is not set, so X-Body-Signature cannot be checked. Set it in the worker's secrets.",
+        },
+        503,
       );
-      if (!ok) return json({ error: "bad signature" }, 401);
     }
+    const declared = Number(request.headers.get("content-length") ?? 0);
+    if (declared > MAX_BODY_BYTES) return json({ error: "body too large" }, 413);
+
+    const rawBody = await request.text();
+    if (rawBody.length > MAX_BODY_BYTES) return json({ error: "body too large" }, 413);
+    const ok = await validSignature(rawBody, request.headers.get("x-body-signature"), secret);
+    if (!ok) return json({ error: "bad signature" }, 401);
 
     let payload;
     try {

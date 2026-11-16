@@ -25,8 +25,9 @@ import {
   type IntercomConversation,
   inScope,
   isDraftSized,
+  newestReply,
   type PendingSend,
-  sentFrom,
+  pickRecordedDraft,
   settingsFrom,
 } from "./capture";
 
@@ -58,16 +59,18 @@ function hasParts(conversation: IntercomConversation): boolean {
 }
 
 /**
- * The conversation the app reasons about. Canvas Kit already sends it; when the payload is a
- * partial and an access token is configured, the conversation is read back from the Intercom API
- * in plain text, so "what the teammate actually sent" is never a guess either.
+ * The conversation the app reasons about. The request's own object is used as-is; a partial
+ * conversation is only read back from the Intercom API when a draft is already known or the
+ * teammate is naming one — never for a conversation nothing has been drafted in, which issue #21
+ * keeps out of scope.
  */
 export async function conversationFor(
   req: CanvasRequest,
   runtime: Runtime,
+  opts: { readFull: boolean },
 ): Promise<IntercomConversation | null> {
   const conversation = req.conversation ?? null;
-  if (!conversation?.id || hasParts(conversation)) return conversation;
+  if (!conversation?.id || hasParts(conversation) || !opts.readFull) return conversation;
   const { settings } = runtime;
   if (!settings.intercomToken) return conversation;
   try {
@@ -97,18 +100,14 @@ async function findRecordedDraft(
   const { settings } = runtime;
   if (!settings.apiKey) return null;
   try {
-    const url = `${settings.baseUrl}/v1/runs?externalId=${encodeURIComponent(`ic:${conversation.id}`)}&agent=${encodeURIComponent(settings.agent)}&limit=1`;
+    // A handful, because the newest run on this conversation may be one of our own captures.
+    const url = `${settings.baseUrl}/v1/runs?externalId=${encodeURIComponent(`ic:${conversation.id}`)}&agent=${encodeURIComponent(settings.agent)}&limit=10`;
     const res = await runtime.fetchImpl(url, { headers: authHeaders(settings) });
     if (!res.ok) return null;
-    const page = (await res.json()) as { items?: Array<{ id?: string; output?: unknown; model?: unknown }> };
-    const run = page.items?.[0];
-    const output = typeof run?.output === "string" ? run.output : "";
-    if (!run?.id || !output.trim()) return null;
-    return draftFromRun(
-      { id: run.id, output, model: typeof run.model === "string" ? run.model : null },
-      runtime.now(),
-      fieldsFrom(conversation, settings),
-    );
+    const page = (await res.json()) as { items?: unknown };
+    const run = pickRecordedDraft(page.items);
+    if (!run) return null;
+    return draftFromRun(run, runtime.now(), fieldsFrom(conversation, settings));
   } catch {
     // No recorded draft; the teammate names the one in the composer instead.
     return null;
@@ -130,14 +129,44 @@ async function postCapture(runtime: Runtime, body: unknown): Promise<CaptureResu
 }
 
 /**
- * What went out: the thread's newest reply, or what the teammate corrected by hand. A note stays
- * a note — the decision below is what refuses it when the install does not record notes.
+ * What went out. A reply Intercom shows is used only when it landed after the draft appeared —
+ * an older reply went out before this draft and is context, not the send. Text the teammate typed
+ * in the panel is taken, but it is their word rather than a verified send, so it is marked as
+ * such in the payload. A note stays a note; the decision refuses it when notes are off.
  */
-export function pendingSend(conversation: IntercomConversation, typed: string): PendingSend | null {
-  const fromThread = sentFrom(conversation);
+export function pendingSend(
+  conversation: IntercomConversation,
+  draft: DraftState | null,
+  typed: string,
+  actor: string | null,
+): PendingSend | null {
   const text = typed.trim();
-  if (text) return { text, type: fromThread?.type ?? "publicReply", at: fromThread?.at ?? null };
-  return fromThread;
+  const reply = newestReply(conversation, { sinceMs: draft?.at ?? null, actor });
+  if (text) {
+    // Prefilled by us from the thread, edited by the teammate: still a reply Intercom shows.
+    if (reply?.afterDraft && text === reply.text) {
+      return {
+        text,
+        type: reply.type,
+        at: reply.at,
+        basis: "thread",
+        partId: reply.id,
+        author: reply.author,
+      };
+    }
+    return { text, type: reply?.type ?? "publicReply", at: null, basis: "typed", unverified: true };
+  }
+  if (reply?.afterDraft) {
+    return {
+      text: reply.text,
+      type: reply.type,
+      at: reply.at,
+      basis: "thread",
+      partId: reply.id,
+      author: reply.author,
+    };
+  }
+  return null;
 }
 
 function readyBase(
@@ -145,15 +174,18 @@ function readyBase(
   draft: DraftState,
   settings: AppSettings,
   state: { sentText: string; reasonCode: string | null; note: string },
+  actor: string | null,
 ): ReadyCanvasInput {
+  const reply = newestReply(conversation, { sinceMs: draft.at, actor });
   return {
     draft,
     settings,
     conversation,
-    sentText: state.sentText.trim() || sentFrom(conversation)?.text || "",
+    sentText: state.sentText.trim() || (reply?.afterDraft ? reply.text : ""),
     reasonCode: state.reasonCode,
     note: state.note,
     signals: aiSignals(conversation),
+    ...(reply && !reply.afterDraft ? { staleReply: reply } : {}),
   };
 }
 
@@ -167,12 +199,27 @@ function readyBase(
  */
 export async function handleCanvasRequest(req: CanvasRequest, runtime: Runtime): Promise<CanvasPayload> {
   const { settings } = runtime;
-  const conversation = await conversationFor(req, runtime);
-  if (!conversation?.id) return idleCanvas(null);
-  if (!inScope(conversation, settings)) return notWatchingCanvas(settings.scopeTag);
-
   const state = readCanvasState(req);
   const clicked = state.clicked;
+  const actor = req.admin?.email?.trim() || req.admin?.name?.trim() || null;
+  /**
+   * Nothing is read from Intercom until a draft is known or the teammate is naming, timing or
+   * capturing one: issue #21 keeps a conversation with no draft in it out of scope.
+   */
+  const needsThread =
+    !!state.draft ||
+    clickedOrigin(clicked) !== null ||
+    reasonCodeFromClick(clicked) !== null ||
+    clicked === COMPONENT.save;
+  const shallow = req.conversation ?? null;
+  if (!shallow?.id) return idleCanvas(null);
+  if (!inScope(shallow, settings)) return notWatchingCanvas(settings.scopeTag);
+
+  // A recorded run is found by conversation id alone, so the panel can say Draft inserted before
+  // anything else about the conversation is read.
+  const recorded = !state.draft && clicked === "" ? await findRecordedDraft(shallow, runtime) : null;
+  const conversation = await conversationFor(req, runtime, { readFull: needsThread || !!recorded });
+  if (!conversation?.id) return idleCanvas(null);
 
   if (clicked === COMPONENT.nameDraft) return namingCanvas(state.draftText);
   if (clicked === COMPONENT.reset || clicked === COMPONENT.startOver) return idleCanvas(null);
@@ -196,25 +243,25 @@ export async function handleCanvasRequest(req: CanvasRequest, runtime: Runtime):
       runtime.now(),
       fieldsFrom(conversation, settings),
     );
-    return readyCanvas(readyBase(conversation, draft, settings, { ...state, reasonCode: null }));
+    return readyCanvas(readyBase(conversation, draft, settings, { ...state, reasonCode: null }, actor));
   }
 
   const chip = reasonCodeFromClick(clicked);
   if (chip && state.draft) {
-    return readyCanvas(readyBase(conversation, state.draft, settings, { ...state, reasonCode: chip }));
+    return readyCanvas(readyBase(conversation, state.draft, settings, { ...state, reasonCode: chip }, actor));
   }
 
   if (clicked === COMPONENT.save) {
     const draft = state.draft;
     if (!draft) return idleCanvas(null, aiSignals(conversation));
-    const base = readyBase(conversation, draft, settings, state);
+    const base = readyBase(conversation, draft, settings, state, actor);
     const decision = decideOnCapture({
       conversation,
       draft,
-      sent: pendingSend(conversation, state.sentText),
+      sent: pendingSend(conversation, draft, state.sentText, actor),
       reasonCode: state.reasonCode,
       reason: state.note,
-      actor: req.admin?.email?.trim() || req.admin?.name?.trim() || null,
+      actor,
       workspaceId: req.workspace_id ?? null,
       settings,
       now: runtime.now(),
@@ -226,7 +273,10 @@ export async function handleCanvasRequest(req: CanvasRequest, runtime: Runtime):
           base,
         );
       }
-      return failedCanvas("No reply to compare against yet. Paste what you sent, then record it.", base);
+      return failedCanvas(
+        "No reply after this draft to compare against yet. Paste what you sent, and it is recorded as confirmed by you.",
+        base,
+      );
     }
     if (decision.action === "need-reason") {
       return failedCanvas(
@@ -238,7 +288,11 @@ export async function handleCanvasRequest(req: CanvasRequest, runtime: Runtime):
       const result = await postCapture(runtime, decision.body);
       return readyCanvas({
         ...base,
-        last: { changed: result.changed, dedup: result.deduplicated },
+        last: {
+          changed: result.changed,
+          dedup: result.deduplicated,
+          unverified: decision.body.metadata?.sentBasis === "typed",
+        },
         caseTitle: result.case?.title ?? null,
       });
     } catch (error) {
@@ -251,8 +305,8 @@ export async function handleCanvasRequest(req: CanvasRequest, runtime: Runtime):
     }
   }
 
-  // Initialize, or a click we do not know: find a recorded draft, else ask for the one in the composer.
-  const liveDraft = state.draft ?? (await findRecordedDraft(conversation, runtime));
-  if (liveDraft) return readyCanvas(readyBase(conversation, liveDraft, settings, state));
+  // Initialize, or a click we do not know: the draft a run recorded, else ask for the one in the composer.
+  const liveDraft = state.draft ?? recorded;
+  if (liveDraft) return readyCanvas(readyBase(conversation, liveDraft, settings, state, actor));
   return idleCanvas(null, aiSignals(conversation));
 }
